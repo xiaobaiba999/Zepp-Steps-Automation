@@ -3,12 +3,17 @@
   "accounts": {
     "322a89455926db15": {
       "date": "2026-10-19",
-      "run_count": 0,
-      "total_steps": 0,
-      "next_run_ts": 0,
+      "run_count": 1,
+      "total_steps": 1613,
+      "next_run_ts": 1792367379.337708,
       "fail_count": 0,
       "done": false
     }
   },
-  "workday_cache": {}
+  "workday_cache": {
+    "2026-10-19": {
+      "rest": false,
+      "source": "按星期回退"
+    }
+  }
 }
