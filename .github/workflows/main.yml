@@ -1,25 +1,51 @@
-# 每日自动修改 Zepp 步数（cron 0 4 UTC = 北京时间 12:00）
+# 每日分时段累加修改 Zepp 步数
+# 每 20 分钟唤醒一次脚本,由脚本根据 state.json 判断是否到点提交:
+#   - 每天北京时间 6:00 提交第一次(1000~2000 随机)
+#   - 之后每 1~2 小时(随机)提交一次,每次在上一次累计基础上再随机加 1000~2000
+#   - 每天共 10 次,完成后当日自动停止,次日 6 点自动重新开始
 name: 自动任务-修改Zepp当天运动数据
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '*/20 * * * *'   # 每 20 分钟唤醒一次(是否真正提交由脚本判断)
+
+concurrency:
+  group: zepp-steps-update   # 同一时刻只允许一个实例,避免状态竞争
+  cancel-in-progress: false
+
+permissions:
+  contents: write            # 允许 Workflow 把 state.json 提交回仓库
 
 jobs:
   run-python-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: '检出仓库代码'
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: '设置 Python 环境'
         uses: actions/setup-python@v6
         with:
           python-version: '3.12.0'
       - name: '安装依赖项'
-        run: pip install requests==2.26.0
+        run: pip install requests
       - name: '运行主程序'
         env:
           ACCOUNT: ${{ secrets.ACCOUNT }}
           PASSWORD: ${{ secrets.PASSWORD }}
         run: python ./main.py
+      - name: '提交并推送状态文件'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "状态无变化,跳过提交"
+          else
+            git commit -m "chore: 更新步数任务状态 [skip ci]"
+            git pull --rebase origin "$GITHUB_REF_NAME" || true
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi
