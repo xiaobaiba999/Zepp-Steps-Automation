@@ -1,4 +1,15 @@
 # -*- coding: UTF-8 -*-
+"""
+Zepp Life(原小米运动)微信步数自动化 · 分时段累加模式
+====================================================
+每天从早上 6 点(北京时间)开始自动提交步数:
+  - 第 1 次提交一个 1000~2000 的随机步数
+  - 之后每次提交 = 上一次累计值 + random(1000, 2000),步数逐次累加
+  - 两次提交之间随机间隔 1~2 小时,每天共执行 10 次,最终当日约 10000~20000 步
+实现方式:Workflow 每 20 分钟唤醒脚本,脚本读 state.json 判断是否到点,
+到点则提交并把新状态写回 state.json(由 Workflow 自动 commit 回仓库),
+跨天后状态自动重置。
+"""
 
 import requests
 import re
@@ -7,7 +18,31 @@ import socket
 import struct
 import time
 import os
+import json
+import hashlib
 import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+# ====================== 全局默认配置(可按需修改) ======================
+
+DEFAULT_START_HOUR = 6        # 每天开始提交的小时(北京时间,24 小时制)
+DEFAULT_RUNS_PER_DAY = 10     # 每天提交次数
+DEFAULT_STEP_MIN = 1000       # 每次累加的步数下限(闭区间)
+DEFAULT_STEP_MAX = 2000       # 每次累加的步数上限(闭区间)
+DEFAULT_INTERVAL_MIN = 60     # 两次提交之间的最小间隔(分钟)
+DEFAULT_INTERVAL_MAX = 120    # 两次提交之间的最大间隔(分钟)
+
+RETRY_INTERVAL_MINUTES = 10   # 提交失败后的重试间隔(分钟)
+MAX_RETRY_PER_DAY = 5         # 单账号每日最大失败重试次数,超过则今日放弃
+DAY_END_HOUR = 23             # 一天中允许安排最后一次提交的截止时刻(北京时间 23:30),
+DAY_END_MINUTE = 30           # 临近该时刻会自动压缩间隔,确保 10 次都能在当天完成
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+BJ_TZ = timezone(timedelta(hours=8))   # 北京时间(UTC+8,无夏令时)
+
+
+# ====================== 登录与提交(Zepp/华米接口,保持原有逻辑) ======================
 
 def login(account, password):
     PHONE_PATTERN = r"(^(1)\d{10}$)"
@@ -15,7 +50,7 @@ def login(account, password):
         account = f"+86{account}"
         third_name = "huami_phone"
     else:
-        third_name = "email"   # 邮箱账号用 email 类型（原 "huami" 会导致 0106）
+        third_name = "email"   # 邮箱账号用 email 类型(原 "huami" 会导致 0106)
 
     headers = {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -26,16 +61,16 @@ def login(account, password):
     data1 = f"client_id=HuaMi&country_code=CN&json_response=true&name={account}&password={password}&redirect_uri=https://s3-us-west-2.amazonaws.com/hm-registration/successsignin.html&state=REDIRECTION&token=access"
     res1 = requests.post(url1, data=data1, headers=headers)
 
-    if res1.status_code == 200:   # 检查状态码是否为200,是则请求成功
+    if res1.status_code == 200:
         r1sc = res1.status_code
         res1 = res1.json()
-        if "access" in res1:   # 检查登录是否成功
+        if "access" in res1:
             print(f"信息:登录成功,Access Code={r1sc}")
             code = res1["access"]
         else:
             print(f"错误:用户名或密码不正确,Access Code={r1sc}")
             return None, None
-    elif res1.status_code == 429:   # 检查状态码是否为429,是则请求过于频繁
+    elif res1.status_code == 429:
         print(f"错误:请求过于频繁,请稍后再试,Access Code={res1.status_code}")
         return None, None
     else:
@@ -46,8 +81,8 @@ def login(account, password):
     data2 = f"app_name=com.xiaomi.hm.health&country_code=CN&code={code}&device_id=00:00:00:00:00:00&device_model=android_phone&app_version=6.12.0&grant_type=access_token&allow_registration=false&source=com.xiaomi.hm.health&third_name={third_name}"
     res2 = requests.post(url2, data=data2, headers=headers)
 
-    res2_body = res2.text   # 先保留原始响应便于诊断
-    if res2.status_code == 200:   # 检查状态码是否为200,是则请求成功
+    res2_body = res2.text
+    if res2.status_code == 200:
         r2sc = res2.status_code
         try:
             res2 = res2.json()
@@ -62,7 +97,7 @@ def login(account, password):
         print(f"错误:登录失败,Login Code={res2.status_code},响应内容(前600字):{res2_body[:600]}")
         return None, None
 
-def get_app_token(login_token):   # 获取 app_token
+def get_app_token(login_token):
     headers = {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
         "user-agent": "MiFit/6.12.0 (MCE16; Android 16; Density/1.5)",
@@ -77,7 +112,7 @@ def get_app_token(login_token):   # 获取 app_token
             print(f"信息:成功获取到 app_token ,Code={res.status_code}")
             return res_data["token_info"]["app_token"]
         else:
-            print("错误:无法解析出有效的 app_token ,Code={res.status_code}")
+            print(f"错误:无法解析出有效的 app_token ,Code={res.status_code}")
             return None
     else:
         print(f"错误:无法获取到有效的 app_token ,Code={res.status_code}")
@@ -89,14 +124,14 @@ def change_steps(account, user_id, app_token, steps):
     if sec_timestamp is None:
         sec_timestamp = int(time.time())
         print(f"警告:NTP 时间获取失败,使用系统时间{sec_timestamp}")
-    
-    dateToday = time.strftime("%F")
+
+    # 使用北京日期。GitHub 服务器是 UTC,若沿用 time.strftime("%F"),
+    # 在北京时间 0~8 点提交时会拿到"昨天"的日期,导致步数记到前一天
+    dateToday = datetime.now(BJ_TZ).strftime("%F")
     deviceID = "0000000000000000"
-    
+
     dataJSON = "%5b%7b%22data_hr%22%3a%22" + "%5c%2fv7%2b"*480 + f"%22%2c%22date%22%3a%22{dateToday}%22%2c%22data%22%3a%5b%7b%22start%22%3a0%2c%22stop%22%3a1439%2c%22value%22%3a%22" + "A"*5760 + f"%22%2c%22tz%22%3a32%2c%22did%22%3a%22{deviceID}%22%2c%22src%22%3a24%7d%5d%2c%22summary%22%3a%22%7b%5c%22v%5c%22%3a6%2c%5c%22slp%5c%22%3a%7b%5c%22st%5c%22%3a0%2c%5c%22ed%5c%22%3a0%2c%5c%22dp%5c%22%3a0%2c%5c%22lt%5c%22%3a0%2c%5c%22wk%5c%22%3a0%2c%5c%22usrSt%5c%22%3a-1440%2c%5c%22usrEd%5c%22%3a-1440%2c%5c%22wc%5c%22%3a0%2c%5c%22is%5c%22%3a0%2c%5c%22lb%5c%22%3a0%2c%5c%22to%5c%22%3a0%2c%5c%22dt%5c%22%3a0%2c%5c%22rhr%5c%22%3a0%2c%5c%22ss%5c%22%3a0%7d%2c%5c%22stp%5c%22%3a%7b%5c%22ttl%5c%22%3a{steps}%2c%5c%22dis%5c%22%3a0%2c%5c%22cal%5c%22%3a0%2c%5c%22wk%5c%22%3a0%2c%5c%22rn%5c%22%3a0%2c%5c%22runDist%5c%22%3a0%2c%5c%22runCal%5c%22%3a0%2c%5c%22stage%5c%22%3a%5b%5d%7d%2c%5c%22goal%5c%22%3a0%2c%5c%22tz%5c%22%3a%5c%2228800%5c%22%7d%22%2c%22source%22%3a24%2c%22type%22%3a0%7d%5d"
-    #dataJSON = URL_encode_dataJSON(dateToday, deviceID, steps)
-    #print(f"信息:dataJSON={dataJSON}")
-    
+
     headers0 = {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
         "user-agent": "MiFit/6.12.0 (MCE16; Android 16; Density/1.5)",
@@ -105,7 +140,7 @@ def change_steps(account, user_id, app_token, steps):
     }
     url0 = f"https://api-mifit-cn.huami.com/v1/data/band_data.json?&t={sec_timestamp}"
     data0 = f"userid={user_id}&last_sync_data_time={sec_timestamp}&device_type=0&last_deviceid={deviceID}&data_json={dataJSON}"
-    
+
     try:
         res0 = requests.post(url0, data=data0, headers=headers0)
         res0_data = res0.json()
@@ -120,29 +155,30 @@ def change_steps(account, user_id, app_token, steps):
 
 def get_sec_timestamp():
     # 通过 NTP 服务器获取秒级时间戳
+    client = None
     try:
         NTP_SERVER = 'ntp.ntsc.ac.cn'
         PORT = 123
         NTP_FORMAT = '!12I'
         NTP_DELTA = 2208988800
-        
+
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         client.settimeout(5)
-        
+
         data = bytearray(48)
         data[0] = 0x1B
-        
+
         client.sendto(data, (NTP_SERVER, PORT))
         data, address = client.recvfrom(1024)
-        
+
         if data:
             unpacked = struct.unpack(NTP_FORMAT, data[:48])
             timestamp = unpacked[10] - NTP_DELTA
             print(f"信息:成功通过 NTP 服务器获取到秒级时间戳,SecTimeStamp={timestamp}")
             return int(timestamp)
-        
+
         return None
-        
+
     except socket.timeout:
         print("错误:连接 NTP 服务器超时")
         return None
@@ -154,81 +190,255 @@ def get_sec_timestamp():
         return None
     finally:
         try:
-            client.close()
+            if client is not None:
+                client.close()
         except:
             pass
 
 
 def URL_encode_dataJSON(dateToday, deviceID, steps):
-    JSON_Frame = f'[{{"date":"{dateToday}","data":[{{"start":0,"stop":1439,"did":"{deviceID}","src":24}}],"summary":"{{\\"stp\\":{{\\"ttl\\":{steps}}}}}","source":24,"type":0}}]'   # 待编码 JSON 模板
-    Encoded_dataJSON = urllib.parse.quote(JSON_Frame, safe='')   # 对 JSON 进行 URL 编码
+    JSON_Frame = f'[{{"date":"{dateToday}","data":[{{"start":0,"stop":1439,"did":"{deviceID}","src":24}}],"summary":"{{\\"stp\\":{{\\"ttl\\":{steps}}}}}","source":24,"type":0}}]'
+    Encoded_dataJSON = urllib.parse.quote(JSON_Frame, safe='')
     return Encoded_dataJSON
 
 
-# 主程序
-if __name__ == "__main__":
-    # 从环境变量安全地获取 GitHub Secret 中的账号与密码
+# ====================== 分时段累加调度(核心新增逻辑) ======================
+
+def account_key(account):
+    # 把账号转成 md5 指纹作为状态键,避免在 state.json 中暴露明文账号
+    return hashlib.md5(str(account).encode("utf-8")).hexdigest()[:16]
+
+
+def mask_account(account):
+    s = str(account)
+    if "@" in s:
+        name, _, domain = s.partition("@")
+        return f"{name[:2]}***@{domain}"
+    if s.isdigit() and len(s) == 11:
+        return f"{s[:3]}****{s[-4:]}"
+    return s[:2] + "***"
+
+
+def normalize_cfg(c):
+    """把 AccountGroup 中每个账号的第三个配置元素统一成 dict 配置"""
+    cfg = {
+        "mode": "cumulative",        # cumulative=分时段累加(新默认) / oneshot=每日一次随机总数(旧模式)
+        "start_hour": DEFAULT_START_HOUR,
+        "runs_per_day": DEFAULT_RUNS_PER_DAY,
+        "step_min": DEFAULT_STEP_MIN,
+        "step_max": DEFAULT_STEP_MAX,
+        "interval_min": DEFAULT_INTERVAL_MIN,
+        "interval_max": DEFAULT_INTERVAL_MAX,
+    }
+    if c is None:
+        return cfg
+    if isinstance(c, dict):
+        cfg.update(c)
+        return cfg
+    # 旧模式:列表 [min, max] 或单个整数 => 每天开始时间后一次性提交随机总步数
+    if isinstance(c, (list, tuple)) and len(c) == 2:
+        return {"mode": "oneshot", "start_hour": DEFAULT_START_HOUR, "step_min": int(c[0]), "step_max": int(c[1])}
+    v = int(c)
+    return {"mode": "oneshot", "start_hour": DEFAULT_START_HOUR, "step_min": v, "step_max": v}
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "accounts" in data:
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    except Exception as e:
+        print(f"警告:读取状态文件失败({e}),将重建状态")
+    return {"version": 1, "accounts": {}}
+
+
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+def submit_steps(account, password, steps):
+    """登录并提交一次步数;成功返回 True"""
+    login_token, userid = login(account, password)
+    if not login_token:
+        print(f"错误:账号:{account},登录失败")
+        return False
+    app_token = get_app_token(login_token)
+    if not app_token:
+        print(f"错误:账号:{account},获取 app_token 失败")
+        return False
+    return change_steps(account, userid, app_token, str(steps))
+
+
+def plan_next_wait_minutes(now, remaining_runs, cfg):
+    """生成两次提交之间的随机等待分钟数(1~2 小时);
+    若临近深夜导致剩余次数排不完,则自动压缩间隔,保证当天 10 次全部完成"""
+    base = random.randint(cfg["interval_min"], cfg["interval_max"])
+    day_end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+    minutes_left = (day_end - now).total_seconds() / 60
+    if remaining_runs > 0 and minutes_left / remaining_runs < base:
+        base = max(20, int(minutes_left // remaining_runs))
+    return base
+
+
+def process_account(account, password, cfg, state, now):
+    """处理单个账号的一次唤醒:判断是否到点,到点则提交并更新状态"""
+    key = account_key(account)
+    entries = state.setdefault("accounts", {})
+    today = now.strftime("%F")
+    entry = entries.get(key)
+
+    # 新账号或跨天:重置当日状态
+    if entry is None or entry.get("date") != today:
+        entry = {
+            "date": today,
+            "run_count": 0,       # 今日已提交次数
+            "total_steps": 0,     # 今日当前累计步数
+            "next_run_ts": 0,     # 下次提交预约时间(Unix 秒级时间戳)
+            "fail_count": 0,      # 今日连续失败次数
+            "done": False,        # 今日是否已全部完成
+        }
+        entries[key] = entry
+
+    now_ts = now.timestamp()
+    tag = mask_account(account)
+
+    # 今日任务已完成
+    if entry.get("done"):
+        print(f"信息:账号:{tag},今日任务已完成(共{entry['run_count']}次,累计{entry['total_steps']}步),本次跳过")
+        return
+
+    # ---------- 旧模式:每天 start_hour 点后一次性提交随机总步数 ----------
+    if cfg["mode"] == "oneshot":
+        if now.hour < cfg["start_hour"]:
+            print(f"信息:账号:{tag},未到每日开始时间({cfg['start_hour']}点),本次跳过")
+            return
+        if entry.get("next_run_ts") and now_ts < entry["next_run_ts"]:
+            return   # 上次失败后,处于静默重试等待期
+        step = random.randint(cfg["step_min"], cfg["step_max"])
+        print(f"信息:账号:{tag},一次性模式,本次提交总步数:{step}")
+        if submit_steps(account, password, step):
+            entry.update({"run_count": 1, "total_steps": step, "done": True, "fail_count": 0, "next_run_ts": 0})
+            print(f"信息:账号:{tag},今日步数修改成功:{step}")
+        else:
+            entry["fail_count"] = entry.get("fail_count", 0) + 1
+            if entry["fail_count"] >= MAX_RETRY_PER_DAY:
+                entry["done"] = True
+                print(f"错误:账号:{tag},连续失败{entry['fail_count']}次,今日放弃")
+            else:
+                entry["next_run_ts"] = now_ts + RETRY_INTERVAL_MINUTES * 60
+                print(f"错误:账号:{tag},提交失败,{RETRY_INTERVAL_MINUTES}分钟后重试(第{entry['fail_count']}/{MAX_RETRY_PER_DAY}次)")
+        return
+
+    # ---------- 累加模式:每天 start_hour 点起,每 1~2 小时随机累加一次 ----------
+    if now.hour < cfg["start_hour"]:
+        print(f"信息:账号:{tag},未到每日开始时间({cfg['start_hour']}点),本次跳过")
+        return
+
+    if entry["run_count"] >= cfg["runs_per_day"]:
+        entry["done"] = True
+        print(f"信息:账号:{tag},今日{cfg['runs_per_day']}次提交已全部完成,累计{entry['total_steps']}步")
+        return
+
+    next_ts = entry.get("next_run_ts") or 0
+    if next_ts and now_ts < next_ts:
+        nxt = datetime.fromtimestamp(next_ts, BJ_TZ)
+        print(f"信息:账号:{tag},下次提交预约时间为 {nxt:%H:%M},本次跳过")
+        return
+
+    # 到点:本次步数 = 当前累计 + random(1000, 2000)
+    delta = random.randint(cfg["step_min"], cfg["step_max"])
+    new_total = entry["total_steps"] + delta
+    which = entry["run_count"] + 1
+    print(f"信息:账号:{tag},今日第 {which}/{cfg['runs_per_day']} 次提交,本次累加 {delta} 步,总步数 {entry['total_steps']} -> {new_total}")
+
+    if submit_steps(account, password, new_total):
+        entry["run_count"] = which
+        entry["total_steps"] = new_total
+        entry["fail_count"] = 0
+        if entry["run_count"] >= cfg["runs_per_day"]:
+            entry["done"] = True
+            entry["next_run_ts"] = 0
+            print(f"信息:账号:{tag},今日任务全部完成!共 {entry['run_count']} 次,累计 {new_total} 步")
+        else:
+            wait = plan_next_wait_minutes(now, cfg["runs_per_day"] - entry["run_count"], cfg)
+            entry["next_run_ts"] = now_ts + wait * 60
+            nxt = datetime.fromtimestamp(entry["next_run_ts"], BJ_TZ)
+            print(f"信息:账号:{tag},下次提交预约:{nxt:%H:%M}(随机间隔约 {wait} 分钟)")
+    else:
+        entry["fail_count"] = entry.get("fail_count", 0) + 1
+        if entry["fail_count"] >= MAX_RETRY_PER_DAY:
+            entry["done"] = True
+            print(f"错误:账号:{tag},连续失败 {entry['fail_count']} 次,今日放弃")
+        else:
+            entry["next_run_ts"] = now_ts + RETRY_INTERVAL_MINUTES * 60
+            print(f"错误:账号:{tag},本次提交失败,{RETRY_INTERVAL_MINUTES} 分钟后自动重试(第 {entry['fail_count']}/{MAX_RETRY_PER_DAY} 次)")
+
+
+def run_tick(now=None):
+    """一次唤醒:遍历所有账号,按状态决定是否提交;状态有变化则写回 state.json"""
+    now = now or datetime.now(BJ_TZ)
+    print(f"===== 唤醒时间(北京时间):{now:%Y-%m-%d %H:%M:%S} =====")
+
+    if not AccountGroup:
+        print("错误:未配置任何账号")
+        return
+
+    state = load_state()
+
+    # 清理已经不在账号组里的历史状态
+    keep_keys = {account_key(acc) for acc, _, _ in AccountGroup}
+    accounts_state = state.setdefault("accounts", {})
+    for stale in [k for k in accounts_state if k not in keep_keys]:
+        del accounts_state[stale]
+
+    snapshot = json.dumps(state, sort_keys=True, ensure_ascii=False)
+
+    for account, password, cfg in AccountGroup:
+        if not account or not password:
+            print("错误:存在未配置的账号或密码(请检查环境变量 ACCOUNT / PASSWORD),已跳过")
+            continue
+        process_account(account, password, normalize_cfg(cfg), state, now)
+
+    if json.dumps(state, sort_keys=True, ensure_ascii=False) != snapshot:
+        save_state(state)
+        print("信息:任务状态已写回 state.json(稍后由 Workflow 自动提交回仓库)")
+    else:
+        print("信息:本次唤醒无状态变化")
+    print("=" * 60)
+
+
+# ====================== 账号配置 ======================
+
+def build_account_group():
+    """从环境变量读取默认账号,并组装账号配置组"""
     ACCOUNT = os.environ.get("ACCOUNT", "")
     PASSWORD = os.environ.get("PASSWORD", "")
-    
-    # 用户账号组配置:每个账号可以设置固定步数或使用随机范围
-    # 配置格式: [账号, 密码, 步数设置]
-        # 步数值选定:
-        # - 固定值: 如 30000
-        # - 随机范围: [最小值, 最大值] 如 [25000, 55000]
-        # - None: 使用默认随机范围
-    AccountGroup = [
-        [ACCOUNT, PASSWORD, [8000, 10000]],   # 随机范围 8000-10000（按需修改）
-        #['账号2', '密码2', [20000, 40000]],  # 使用随机范围20000-40000
-        #['账号3', '密码3', [30000, 50000]],  # 使用随机范围30000-50000
-        #['账号4', '密码4', 50000],  # 使用定值步数50000
+    return [
+        # 每行格式: [账号, 密码, 步数配置]
+        # 第三个元素(步数配置)的取值:
+        #   None            -> 全局默认(分时段累加):每天 6 点开始,每 1~2 小时随机累加
+        #                      1000~2000 步,共 10 次,最终全天约 10000~20000 步
+        #   dict            -> 自定义累加参数,可选字段:
+        #                      start_hour(开始小时) / runs_per_day(每日次数) /
+        #                      step_min, step_max(每次累加范围) /
+        #                      interval_min, interval_max(间隔分钟范围)
+        #                      如 {"start_hour": 7, "runs_per_day": 8, "step_min": 800, "step_max": 1500}
+        #   [min, max] / 整数 -> 旧模式:每天 6 点后一次性提交随机总步数(如 [8000, 10000])
+        [ACCOUNT, PASSWORD, None],
+        # ['账号2', '密码2', None],
+        # ['账号3', '密码3', {"runs_per_day": 8, "step_min": 800, "step_max": 1600}],
+        # ['账号4', '密码4', [8000, 10000]],
     ]
-    
-    # 默认随机范围（用于步数设置为None的情况）
-    DefaultRandomMin = 35000
-    DefaultRandomMax = 65000
-    
-    for i in AccountGroup:   # 遍历用户账号组中的每个账号信息并对每个用户账号执行步数刷取操作
-        account = i[0]
-        password = i[1]
-        step_config = i[2]
-        
-        # 根据步数配置类型确定最终步数
-        if step_config is None:
-            # 使用默认随机范围
-            step = random.randint(DefaultRandomMin, DefaultRandomMax)
-            print(f"信息:账号:{account},本次步数类型:默认范围随机,本次随机范围:[{DefaultRandomMin}-{DefaultRandomMax}],本次最终步数:{step}")
-        elif isinstance(step_config, list) and len(step_config) == 2:
-            # 使用自定义随机范围
-            random_min, random_max = step_config
-            step = random.randint(random_min, random_max)
-            print(f"信息:账号:{account},本次步数类型:自定义范围随机,本次随机范围:[{random_min}-{random_max}],本次最终步数:{step}")
-        else:
-            # 使用固定步数
-            step = step_config
-            print(f"信息:账号:{account},本次步数类型:定值,本次最终步数:{step}")
-        
-        # 登录获取token
-        login_token, userid = login(account, password)
-        if not login_token:
-            print(f'错误:账号:{account},登录失败')
-            continue
-        else:
-            print(f'信息:账号:{account},登录成功')
-        
-        # 获取app_token
-        app_token = get_app_token(login_token)
-        if not app_token:
-            print(f'错误:账号:{account},获取 app_token 失败')
-            continue
-        else:
-            print(f'信息:账号:{account},获取 app_token 成功')
-        
-        # 修改步数
-        result = change_steps(account, userid, app_token, str(step))
-        if result:
-            print(f'信息:账号:{account} 步数修改成功')
-        else:
-            print(f'错误:账号:{account} 步数修改失败')
-        
-        print("-" * 50)
+
+
+AccountGroup = []
+
+if __name__ == "__main__":
+    AccountGroup = build_account_group()
+    run_tick()
