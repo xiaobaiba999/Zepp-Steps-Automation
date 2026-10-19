@@ -1,27 +1,32 @@
-# 每日分时段累加修改 Zepp 步数(长驻时间窗模式)
+# 每日分时段累加修改 Zepp 步数(长驻时间窗 + 接力链模式)
 #
-# 为什么不是每 20 分钟一次?
-#   实测 GitHub 会对 scheduled(定时)触发大幅延迟甚至整批跳过(*/20 一天实际
-#   只触发几次),导致预约好的提交时间无人唤醒、步数远少于预期。
-#   因此改为「每天 4 个长驻时间窗」:每次触发后脚本连续运行约 5.5 小时,
-#   内部每 20 分钟自检一次,把对 GitHub 调度的依赖从每天 72 次准点
-#   降到每天 4 次大致准点,可靠性大幅提升。
+# 为什么不靠 GitHub 的定时(schedule)触发?
+#   实测 GitHub 会对 scheduled 触发大幅延迟甚至整批丢弃(*/20 一天实际只触发
+#   几次;改 4 个时间窗后也曾整班不来),预约好的提交时间无人唤醒、步数远少于
+#   预期。因此采用「接力链」:每一班进程连续长驻约 5.5 小时,退出时通过 GitHub
+#   API 亲自触发下一班(workflow_dispatch 是官方文档明确允许由 GITHUB_TOKEN
+#   触发的事件,准点率远高于 schedule)。链条全天滚动、完全不依赖 cron 的可靠
+#   性;下方 4 个 cron 仅作链条断裂时的兜底,手动 Run workflow 也可随时拉起。
+#
+# 班次衔接(北京时间):05:30~11:00 / 11:20~16:50 / 16:50~22:20 / 22:20~23:40,
+# 每班结束自动接力下一班,全天无缝覆盖;即使某班被 GitHub 丢弃也不影响后续。
 name: 自动任务-修改Zepp当天运动数据
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 21 * * *'   # 北京时间 05:30 开跑,覆盖到 11:00
-    - cron: '20 3 * * *'    # 北京时间 11:20 开跑,覆盖到 16:50
-    - cron: '50 8 * * *'    # 北京时间 16:50 开跑,覆盖到 22:20
-    - cron: '20 14 * * *'   # 北京时间 22:20 开跑,收尾当日剩余次数
+    - cron: '30 21 * * *'   # 兜底:北京时间 05:30
+    - cron: '20 3 * * *'    # 兜底:北京时间 11:20
+    - cron: '50 8 * * *'    # 兜底:北京时间 16:50
+    - cron: '20 14 * * *'   # 兜底:北京时间 22:20
 
 concurrency:
   group: zepp-steps-update   # 同一时刻只允许一个实例,避免状态竞争
-  cancel-in-progress: false
+  cancel-in-progress: true   # 新触发直接接管旧班次(状态每次提交后已实时回写仓库,可安全接管)
 
 permissions:
   contents: write            # 允许把 state.json 提交回仓库
+  actions: write             # 允许脚本在班次结束时接力触发下一班(接力链)
 
 jobs:
   run-python-script:
@@ -42,18 +47,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: '运行主程序(定时触发:长驻时间窗模式)'
-        if: github.event_name != 'workflow_dispatch'
+      - name: '运行主程序(长驻班次:接力/定时/手动触发一视同仁)'
         env:
           ACCOUNT: ${{ secrets.ACCOUNT }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 接力链触发下一班必需
         run: python ./main.py --daemon --max-minutes 330
-      - name: '运行主程序(手动触发:单次自检,用于调试)'
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          ACCOUNT: ${{ secrets.ACCOUNT }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-        run: python ./main.py
       - name: '提交并推送状态文件(兜底)'
         run: |
           git add state.json
