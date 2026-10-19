@@ -1,26 +1,32 @@
-# 每日分时段累加修改 Zepp 步数
-# 每 20 分钟唤醒一次脚本,由脚本根据 state.json 判断是否到点提交:
-#   - 每天北京时间 6:00 提交第一次(1000~2000 随机)
-#   - 之后每 1~2 小时(随机)提交一次,每次在上一次累计基础上再随机加 1000~2000
-#   - 每天共 10 次,完成后当日自动停止,次日 6 点自动重新开始
+# 每日分时段累加修改 Zepp 步数(长驻时间窗模式)
+#
+# 为什么不是每 20 分钟一次?
+#   实测 GitHub 会对 scheduled(定时)触发大幅延迟甚至整批跳过(*/20 一天实际
+#   只触发几次),导致预约好的提交时间无人唤醒、步数远少于预期。
+#   因此改为「每天 4 个长驻时间窗」:每次触发后脚本连续运行约 5.5 小时,
+#   内部每 20 分钟自检一次,把对 GitHub 调度的依赖从每天 72 次准点
+#   降到每天 4 次大致准点,可靠性大幅提升。
 name: 自动任务-修改Zepp当天运动数据
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/20 * * * *'   # 每 20 分钟唤醒一次(是否真正提交由脚本判断)
+    - cron: '30 21 * * *'   # 北京时间 05:30 开跑,覆盖到 11:00
+    - cron: '20 3 * * *'    # 北京时间 11:20 开跑,覆盖到 16:50
+    - cron: '50 8 * * *'    # 北京时间 16:50 开跑,覆盖到 22:20
+    - cron: '20 14 * * *'   # 北京时间 22:20 开跑,收尾当日剩余次数
 
 concurrency:
   group: zepp-steps-update   # 同一时刻只允许一个实例,避免状态竞争
   cancel-in-progress: false
 
 permissions:
-  contents: write            # 允许 Workflow 把 state.json 提交回仓库
+  contents: write            # 允许把 state.json 提交回仓库
 
 jobs:
   run-python-script:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 350     # 5.5 小时长驻 + 安装依赖等开销的缓冲(< GitHub 6 小时上限)
     steps:
       - name: '检出仓库代码'
         uses: actions/checkout@v6
@@ -32,15 +38,24 @@ jobs:
           python-version: '3.12.0'
       - name: '安装依赖项'
         run: pip install requests
-      - name: '运行主程序'
+      - name: '配置 Git 提交身份'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: '运行主程序(定时触发:长驻时间窗模式)'
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          ACCOUNT: ${{ secrets.ACCOUNT }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: python ./main.py --daemon --max-minutes 330
+      - name: '运行主程序(手动触发:单次自检,用于调试)'
+        if: github.event_name == 'workflow_dispatch'
         env:
           ACCOUNT: ${{ secrets.ACCOUNT }}
           PASSWORD: ${{ secrets.PASSWORD }}
         run: python ./main.py
-      - name: '提交并推送状态文件'
+      - name: '提交并推送状态文件(兜底)'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state.json
           if git diff --cached --quiet; then
             echo "状态无变化,跳过提交"
