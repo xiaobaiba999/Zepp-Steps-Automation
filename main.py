@@ -80,6 +80,17 @@ CATCHUP_MAX_ROUNDS = 4            # 单次自检最多连环补交轮数(防止�
 CATCHUP_SLEEP_RANGE = (60, 150)   # 补交轮之间的随机间隔(秒),模拟自然的连续活动
 DAEMON_MAX_MINUTES = 330          # 长驻模式单次最长运行时长(分钟),需小于 Job 的 6 小时上限
 
+# ---- 接力链(彻底摆脱 GitHub 对 schedule 触发的延迟/跳过) ----
+# 实测 GitHub 会把定时(schedule)触发大幅延迟甚至整批丢弃(上一班跑完后,
+# 下一班可能迟迟不来甚至全天不来)。接力链:每班退出时由脚本通过 GitHub API
+# 亲自触发下一班(workflow_dispatch 是 GitHub 文档明确允许 GITHUB_TOKEN 触发的
+# 两种事件之一,走 API 的触发基本秒级准点),从而完全不依赖 cron 的可靠性。
+# cron 时间窗仅作兜底保留。注意:接力链约 24 小时占用 1 个 runner(公开仓库免费);
+# 若仓库转为私有会消耗 Actions 配额,请置 SELF_DISPATCH=False 或删除该功能。
+SELF_DISPATCH = True              # True=班次结束时自动接力触发下一班;False=仅靠 cron 兕底
+SELF_DISPATCH_MAX_RETRY = 3       # 接力触发失败时的重试次数
+SELF_DISPATCH_RETRY_SLEEP = 5     # 接力触发重试间隔(秒)
+
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 BJ_TZ = timezone(timedelta(hours=8))   # 北京时间(UTC+8,无夏令时)
@@ -601,6 +612,42 @@ def push_state_if_changed():
         print(f"警告:提交 state.json 失败:{e}")
 
 
+def dispatch_next_run():
+    """接力链:班次结束时通过 GitHub API 触发下一班 workflow run。
+    使用 Actions 自动注入的 GITHUB_TOKEN(需 workflow 权限 actions:write)。
+    workflow_dispatch / repository_dispatch 是 GitHub 文档明确允许由
+    GITHUB_TOKEN 触发新运行的两个例外事件,因此无需个人 Token。
+    仅在 GitHub Actions 环境且 SELF_DISPATCH 开启时生效,本地/测试自动跳过。"""
+    if not SELF_DISPATCH or os.environ.get("DISABLE_SELF_DISPATCH") == "1":
+        return
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        print("信息:非 Actions 环境,跳过接力触发")
+        return
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    branch = os.environ.get("GITHUB_REF_NAME", "main")
+    if not token or not repo:
+        print("警告:缺少 GITHUB_TOKEN / GITHUB_REPOSITORY,无法接力触发下一班,将由 cron 时间窗兜底")
+        return
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/main.yml/dispatches"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    for attempt in range(1, SELF_DISPATCH_MAX_RETRY + 1):
+        try:
+            res = requests.post(url, json={"ref": branch}, headers=headers, timeout=15)
+            if res.status_code == 204:
+                print(f"信息:接力链:已触发下一班长驻(第 {attempt} 次尝试成功),约半分钟内接管")
+                return
+            print(f"警告:接力触发返回 HTTP {res.status_code}:{res.text[:200]}({attempt}/{SELF_DISPATCH_MAX_RETRY})")
+        except Exception as e:
+            print(f"警告:接力触发异常:{e}({attempt}/{SELF_DISPATCH_MAX_RETRY})")
+        time.sleep(SELF_DISPATCH_RETRY_SLEEP)
+    print("错误:接力触发最终失败,后续依赖 cron 时间窗兜底唤醒")
+
+
 def _daemon_can_exit():
     """当日所有账号任务完成,且已超过当天最后可用唤醒点(23:40)时允许提前退出"""
     now = datetime.now(BJ_TZ)
@@ -647,6 +694,9 @@ def run_daemon(max_minutes=None, tick_minutes=None):
         remain = started + tick_minutes * 60 - time.time()
         if remain > 0:
             time.sleep(remain)
+
+    # 无论因时长到限还是任务完成收尾,都接力触发下一班,保持链条不断
+    dispatch_next_run()
     print("===== 长驻模式结束 =====")
 
 
