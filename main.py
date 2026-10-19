@@ -14,14 +14,19 @@ Zepp Life(原小米运动)微信步数自动化 · 分时段累加模式
 
 实现方式
 --------
-GitHub Actions 单个 Job 最长只能运行 6 小时,无法在一次运行里完成全天
-跨度 10~20 小时的提交,因此采用「定时唤醒 + 状态文件」方案:
-  1. Workflow 每 20 分钟触发一次 main.py(见 .github/workflows/main.yml)
-  2. 脚本读取仓库中的 state.json,判断当前是否到达某次提交的"预约时间"
-  3. 到点则登录 Zepp,提交一次"累计总步数"
-  4. 把新状态(累计步数 / 已提交次数 / 下次提交时间)写回 state.json
-  5. Workflow 自动把 state.json commit & push 回仓库,供下次唤醒时读取
-  6. 跨天后状态自动重置,重新从 6 点开始,如此往复
+GitHub Actions 有两个限制:
+  1. 单个 Job 最长只能运行 6 小时,无法一次跑完全天 10~20 小时的提交跨度;
+  2. 对 scheduled(定时)触发经常大幅延迟甚至整批跳过(实测 */20 的 cron
+     一天实际只触发几次,预约好的提交时间无人唤醒,导致步数远少于预期)。
+因此采用「长驻时间窗 + 状态文件」方案:
+  1. Workflow 每天在 4 个时间窗启动(北京 05:30 / 11:20 / 16:50 / 22:20),
+     每个窗口内脚本以长驻模式连续运行约 5.5 小时,每 20 分钟自检一次;
+  2. 自检时读取仓库中的 state.json,判断当前是否到达某次提交的"预约时间";
+  3. 到点则登录 Zepp,提交一次"累计总步数"(= 上次累计 + random(1000,2000));
+  4. 把新状态写回 state.json,并立刻由脚本自己 commit & push 回仓库;
+  5. 若发现进度落后于当日均匀计划(说明之前的触发被 GitHub 跳过),
+     脚本会自动连环补交(每轮间隔 1~2.5 分钟),确保当天次数完成;
+  6. 跨天后状态自动重置,重新从 6 点开始,如此往复。
 每天次数按「工作日/休息日」自动区分:优先调用免费节假日接口识别法定节假日
 与调休补班(可关闭),接口失败时回退为「周一至周五=工作日、周六日=休息日」。
 """
@@ -33,8 +38,10 @@ import socket
 import struct
 import time
 import os
+import sys
 import json
 import hashlib
+import subprocess
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
@@ -61,9 +68,17 @@ HOLIDAY_OVERRIDES = {}
 
 RETRY_INTERVAL_MINUTES = 10   # 提交失败后的重试间隔(分钟)
 MAX_RETRY_PER_DAY = 5         # 单账号每日最大失败重试次数,超过则今日放弃
-DAY_END_HOUR = 23             # 当天最后一个可用唤醒点(北京时间 23:40,按 20 分钟周期),
+DAY_END_HOUR = 23             # 当天最后一个可用唤醒点(北京时间 23:40,按自检周期),
 DAY_END_MINUTE = 40           # 间隔规划会预留完整槽位,确保当天次数全部完成
-WAKE_TICK_MINUTES = 20        # main.yml 中 cron 的唤醒间隔(分钟),间隔规划会对齐到该周期
+WAKE_TICK_MINUTES = 20        # 长驻模式内部自检周期(分钟),间隔规划会对齐到该周期
+
+# ---- 断层补交(应对 GitHub Actions 定时调度被延迟/跳过) ----
+# 实测 GitHub 会把 */20 的 cron 大幅延迟甚至整批跳过,预约时间常无人唤醒。
+# 补交逻辑:提交后若按当日均匀计划计算进度仍落后,就在本轮继续连环补交。
+CATCHUP_GRACE_MINUTES = 15        # 进度落后超过该分钟数才判定为落后(避免正常抖动触发)
+CATCHUP_MAX_ROUNDS = 4            # 单次自检最多连环补交轮数(防止一次补太密)
+CATCHUP_SLEEP_RANGE = (60, 150)   # 补交轮之间的随机间隔(秒),模拟自然的连续活动
+DAEMON_MAX_MINUTES = 330          # 长驻模式单次最长运行时长(分钟),需小于 Job 的 6 小时上限
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
@@ -230,7 +245,7 @@ def URL_encode_dataJSON(dateToday, deviceID, steps):
     return Encoded_dataJSON
 
 
-# ====================== 分时段累加调度(核心新增逻辑) ======================
+# ====================== 分时段累加调度(核心逻辑) ======================
 
 def account_key(account):
     # 把账号转成 md5 指纹作为状态键,避免在 state.json 中暴露明文账号
@@ -359,11 +374,11 @@ def get_runs_for_date(cfg, date_str, state):
 
 
 def plan_next_wait_minutes(now, remaining_runs, cfg):
-    """生成两次提交之间的随机等待分钟数(1~2 小时,对齐唤醒周期);
+    """生成两次提交之间的随机等待分钟数(1~2 小时,对齐自检周期);
     若剩余次数在当天排不完(如工作日 14 次),则按「最后一个可用唤醒点 -
-    剩余次数 x 唤醒周期」自动压缩间隔,保证剩余每一次都有可用槽位"""
+    剩余次数 x 自检周期」自动压缩间隔,保证剩余每一次都有可用槽位"""
     base = random.randint(cfg["interval_min"], cfg["interval_max"])
-    wait = max(1, -(-base // WAKE_TICK_MINUTES)) * WAKE_TICK_MINUTES   # 对齐到唤醒周期整数倍
+    wait = max(1, -(-base // WAKE_TICK_MINUTES)) * WAKE_TICK_MINUTES   # 对齐到自检周期整数倍
     # 当天最后一个可用唤醒点之前,必须给剩余每一次都留出槽位
     day_end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
     latest_next = day_end - (remaining_runs - 1) * timedelta(minutes=WAKE_TICK_MINUTES)
@@ -373,8 +388,27 @@ def plan_next_wait_minutes(now, remaining_runs, cfg):
     return int(wait)
 
 
+def is_behind_schedule(now, run_count, today_runs, cfg):
+    """判断当前完成进度是否落后于当日均匀计划(用于唤醒断层后连环补交)。
+    计划:从 start_hour 到当天截止点,today_runs 次提交均匀分布,
+    第 run_count 次应完成的时刻 = start + 全程时长 x run_count / today_runs。
+    若当前时间已超过该时刻 CATCHUP_GRACE_MINUTES 分钟以上,视为落后。"""
+    if run_count >= today_runs:
+        return False
+    start = now.replace(hour=cfg["start_hour"], minute=0, second=0, microsecond=0)
+    day_end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+    total = (day_end - start).total_seconds()
+    if total <= 0:
+        return False
+    slot = start + timedelta(seconds=total * run_count / today_runs)
+    return now > slot + timedelta(minutes=CATCHUP_GRACE_MINUTES)
+
+
 def process_account(account, password, cfg, state, now):
-    """处理单个账号的一次唤醒:判断是否到点,到点则提交并更新状态"""
+    """处理单个账号的一次自检:判断是否到点,到点则提交并更新状态。
+    若提交后按均匀计划进度仍落后(说明之前有预约被跳过),则在本轮
+    连环补交(每轮间隔 CATCHUP_SLEEP_RANGE 秒,最多 CATCHUP_MAX_ROUNDS 轮)。
+    返回值:本次自检是否至少成功提交过一次。"""
     key = account_key(account)
     entries = state.setdefault("accounts", {})
     today = now.strftime("%F")
@@ -398,82 +432,106 @@ def process_account(account, password, cfg, state, now):
     # 今日任务已完成
     if entry.get("done"):
         print(f"信息:账号:{tag},今日任务已完成(共{entry['run_count']}次,累计{entry['total_steps']}步),本次跳过")
-        return
+        return False
 
     # ---------- 旧模式:每天 start_hour 点后一次性提交随机总步数 ----------
     if cfg["mode"] == "oneshot":
         if now.hour < cfg["start_hour"]:
             print(f"信息:账号:{tag},未到每日开始时间({cfg['start_hour']}点),本次跳过")
-            return
+            return False
         if entry.get("next_run_ts") and now_ts < entry["next_run_ts"]:
-            return   # 上次失败后,处于静默重试等待期
+            return False   # 上次失败后,处于静默重试等待期
         step = random.randint(cfg["step_min"], cfg["step_max"])
         print(f"信息:账号:{tag},一次性模式,本次提交总步数:{step}")
         if submit_steps(account, password, step):
             entry.update({"run_count": 1, "total_steps": step, "done": True, "fail_count": 0, "next_run_ts": 0})
             print(f"信息:账号:{tag},今日步数修改成功:{step}")
+            return True
+        entry["fail_count"] = entry.get("fail_count", 0) + 1
+        if entry["fail_count"] >= MAX_RETRY_PER_DAY:
+            entry["done"] = True
+            print(f"错误:账号:{tag},连续失败{entry['fail_count']}次,今日放弃")
         else:
+            entry["next_run_ts"] = now_ts + RETRY_INTERVAL_MINUTES * 60
+            print(f"错误:账号:{tag},提交失败,{RETRY_INTERVAL_MINUTES}分钟后重试(第{entry['fail_count']}/{MAX_RETRY_PER_DAY}次)")
+        return False
+
+    # ---------- 累加模式:每天 start_hour 点起,每 1~2 小时随机累加一次 ----------
+    # 今日目标次数:工作日 14 次 / 休息日 10 次(可被账号配置 runs_per_day 覆盖)
+    today_runs = get_runs_for_date(cfg, today, state)
+    submitted = False   # 本次自检是否至少成功提交过一次
+    rounds = 0          # 本次自检已连环补交的轮数
+    catchup = False     # 补交模式:跳过预约检查,直接连续提交追平进度
+
+    while True:
+        if now.hour < cfg["start_hour"]:
+            print(f"信息:账号:{tag},未到每日开始时间({cfg['start_hour']}点),本次跳过")
+            return submitted
+
+        if entry["run_count"] >= today_runs:
+            entry["done"] = True
+            print(f"信息:账号:{tag},今日{today_runs}次提交已全部完成,累计{entry['total_steps']}步")
+            return submitted
+
+        next_ts = entry.get("next_run_ts") or 0
+        if not catchup and next_ts and now_ts < next_ts:
+            nxt = datetime.fromtimestamp(next_ts, BJ_TZ)
+            print(f"信息:账号:{tag},下次提交预约时间为 {nxt:%H:%M},本次跳过")
+            return submitted
+
+        # 到点(或错过预约后的补交):本次步数 = 当前累计 + random(1000, 2000)
+        delta = random.randint(cfg["step_min"], cfg["step_max"])
+        new_total = entry["total_steps"] + delta
+        which = entry["run_count"] + 1
+        print(f"信息:账号:{tag},今日第 {which}/{today_runs} 次提交,本次累加 {delta} 步,总步数 {entry['total_steps']} -> {new_total}")
+
+        if not submit_steps(account, password, new_total):
             entry["fail_count"] = entry.get("fail_count", 0) + 1
             if entry["fail_count"] >= MAX_RETRY_PER_DAY:
                 entry["done"] = True
-                print(f"错误:账号:{tag},连续失败{entry['fail_count']}次,今日放弃")
+                print(f"错误:账号:{tag},连续失败 {entry['fail_count']} 次,今日放弃")
             else:
                 entry["next_run_ts"] = now_ts + RETRY_INTERVAL_MINUTES * 60
-                print(f"错误:账号:{tag},提交失败,{RETRY_INTERVAL_MINUTES}分钟后重试(第{entry['fail_count']}/{MAX_RETRY_PER_DAY}次)")
-        return
+                print(f"错误:账号:{tag},本次提交失败,{RETRY_INTERVAL_MINUTES} 分钟后自动重试(第 {entry['fail_count']}/{MAX_RETRY_PER_DAY} 次)")
+            return submitted
 
-    # ---------- 累加模式:每天 start_hour 点起,每 1~2 小时随机累加一次 ----------
-    if now.hour < cfg["start_hour"]:
-        print(f"信息:账号:{tag},未到每日开始时间({cfg['start_hour']}点),本次跳过")
-        return
-
-    # 今日目标次数:工作日 14 次 / 休息日 10 次(可被账号配置 runs_per_day 覆盖)
-    today_runs = get_runs_for_date(cfg, today, state)
-
-    if entry["run_count"] >= today_runs:
-        entry["done"] = True
-        print(f"信息:账号:{tag},今日{today_runs}次提交已全部完成,累计{entry['total_steps']}步")
-        return
-
-    next_ts = entry.get("next_run_ts") or 0
-    if next_ts and now_ts < next_ts:
-        nxt = datetime.fromtimestamp(next_ts, BJ_TZ)
-        print(f"信息:账号:{tag},下次提交预约时间为 {nxt:%H:%M},本次跳过")
-        return
-
-    # 到点:本次步数 = 当前累计 + random(1000, 2000)
-    delta = random.randint(cfg["step_min"], cfg["step_max"])
-    new_total = entry["total_steps"] + delta
-    which = entry["run_count"] + 1
-    print(f"信息:账号:{tag},今日第 {which}/{today_runs} 次提交,本次累加 {delta} 步,总步数 {entry['total_steps']} -> {new_total}")
-
-    if submit_steps(account, password, new_total):
+        # 提交成功
+        submitted = True
         entry["run_count"] = which
         entry["total_steps"] = new_total
         entry["fail_count"] = 0
+        rounds += 1
+
         if entry["run_count"] >= today_runs:
             entry["done"] = True
             entry["next_run_ts"] = 0
             print(f"信息:账号:{tag},今日任务全部完成!共 {entry['run_count']} 次,累计 {new_total} 步")
-        else:
-            wait = plan_next_wait_minutes(now, today_runs - entry["run_count"], cfg)
-            entry["next_run_ts"] = now_ts + wait * 60
+            return True
+
+        wait = plan_next_wait_minutes(now, today_runs - entry["run_count"], cfg)
+        entry["next_run_ts"] = now_ts + wait * 60
+
+        # 追赶判断:若按当日均匀计划进度仍落后(说明之前有预约被 GitHub 跳过),
+        # 则稍作停顿后在本轮继续补交,直到追上计划或达到轮数上限
+        if rounds >= CATCHUP_MAX_ROUNDS or not is_behind_schedule(now, entry["run_count"], today_runs, cfg):
             nxt = datetime.fromtimestamp(entry["next_run_ts"], BJ_TZ)
             print(f"信息:账号:{tag},下次提交预约:{nxt:%H:%M}(随机间隔约 {wait} 分钟)")
-    else:
-        entry["fail_count"] = entry.get("fail_count", 0) + 1
-        if entry["fail_count"] >= MAX_RETRY_PER_DAY:
-            entry["done"] = True
-            print(f"错误:账号:{tag},连续失败 {entry['fail_count']} 次,今日放弃")
-        else:
-            entry["next_run_ts"] = now_ts + RETRY_INTERVAL_MINUTES * 60
-            print(f"错误:账号:{tag},本次提交失败,{RETRY_INTERVAL_MINUTES} 分钟后自动重试(第 {entry['fail_count']}/{MAX_RETRY_PER_DAY} 次)")
+            return True
+
+        gap = random.randint(*CATCHUP_SLEEP_RANGE)
+        print(f"信息:账号:{tag},检测到今日进度落后(部分唤醒被跳过),{gap} 秒后继续补交")
+        time.sleep(gap)
+        now = datetime.now(BJ_TZ)
+        now_ts = now.timestamp()
+        if entry.get("date") != now.strftime("%F"):   # 极端情况:补交跨天,留待下轮自检重置
+            return True
+        catchup = True   # 继续补交时跳过预约检查(刚规划的预约是为"下一次正常节奏"服务的)
 
 
 def run_tick(now=None):
-    """一次唤醒:遍历所有账号,按状态决定是否提交;状态有变化则写回 state.json"""
+    """一次自检:遍历所有账号,按状态决定是否提交;状态有变化则写回 state.json"""
     now = now or datetime.now(BJ_TZ)
-    print(f"===== 唤醒时间(北京时间):{now:%Y-%m-%d %H:%M:%S} =====")
+    print(f"===== 自检时间(北京时间):{now:%Y-%m-%d %H:%M:%S} =====")
 
     if not AccountGroup:
         print("错误:未配置任何账号")
@@ -504,10 +562,92 @@ def run_tick(now=None):
 
     if json.dumps(state, sort_keys=True, ensure_ascii=False) != snapshot:
         save_state(state)
-        print("信息:任务状态已写回 state.json(稍后由 Workflow 自动提交回仓库)")
+        print("信息:任务状态已写回 state.json(长驻模式下由脚本立即提交回仓库,单次模式下由 Workflow 兜底提交)")
     else:
-        print("信息:本次唤醒无状态变化")
+        print("信息:本次自检无状态变化")
     print("=" * 60)
+
+
+def push_state_if_changed():
+    """把 state.json 的变化 commit & push 回仓库(长驻模式下由脚本自己完成)。
+    concurrency 锁保证同时只有一个运行实例,一般不会冲突;pull --rebase 兜底。"""
+    if os.environ.get("DISABLE_STATE_PUSH") == "1":
+        return
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    branch = os.environ.get("GITHUB_REF_NAME", "main")
+    try:
+        def _git(*args, check=True):
+            return subprocess.run(
+                ["git", *args], cwd=repo_dir, check=check,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+
+        _git("add", "state.json", check=False)
+        unchanged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=repo_dir,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        if unchanged.returncode == 0:
+            print("信息:state.json 无变化,跳过提交")
+            return
+        _git("commit", "-m", "chore: 更新步数任务状态 [skip ci]")
+        _git("pull", "--rebase", "origin", branch, check=False)
+        res = _git("push", "origin", f"HEAD:{branch}", check=False)
+        if res.returncode == 0:
+            print(f"信息:state.json 已提交并推送回仓库({branch})")
+        else:
+            print(f"警告:state.json 推送失败:{(res.stdout or '')[-400:]}")
+    except Exception as e:
+        print(f"警告:提交 state.json 失败:{e}")
+
+
+def _daemon_can_exit():
+    """当日所有账号任务完成,且已超过当天最后可用唤醒点(23:40)时允许提前退出"""
+    now = datetime.now(BJ_TZ)
+    if (now.hour, now.minute) < (DAY_END_HOUR, DAY_END_MINUTE):
+        return False
+    state = load_state()
+    today = now.strftime("%F")
+    accounts_state = state.get("accounts", {})
+    keys = [account_key(acc) for acc, _, _ in AccountGroup]
+    if not keys:
+        return False
+    return all(
+        accounts_state.get(k, {}).get("date") == today
+        and accounts_state[k].get("done")
+        for k in keys
+    )
+
+
+def run_daemon(max_minutes=None, tick_minutes=None):
+    """长驻模式:进程内每 tick_minutes 分钟做一次自检,连续运行直到达到最长时长,
+    或当日任务全部完成且超过当天截止点(自动收尾)。
+    用于应对 GitHub Actions 对 scheduled 触发的大幅延迟/跳过:
+    每天只需 4 个大致准点的触发窗口,窗口内到点提交、错过则自动补交。"""
+    max_minutes = int(max_minutes or DAEMON_MAX_MINUTES)
+    tick_minutes = int(tick_minutes or WAKE_TICK_MINUTES)
+    print(f"===== 进入长驻模式:每 {tick_minutes} 分钟自检一次,最长运行 {max_minutes} 分钟 =====")
+    deadline = time.time() + max_minutes * 60
+
+    while True:
+        started = time.time()
+        try:
+            run_tick()
+        except Exception as e:
+            print(f"错误:本次自检出现异常:{e}")
+        push_state_if_changed()
+
+        if time.time() >= deadline:
+            print("信息:已达本次长驻运行时长上限,正常退出(下一个时间窗会继续接管)")
+            break
+        if _daemon_can_exit():
+            print("信息:今日任务已全部完成且超过当天截止点,长驻模式提前收尾")
+            break
+
+        remain = started + tick_minutes * 60 - time.time()
+        if remain > 0:
+            time.sleep(remain)
+    print("===== 长驻模式结束 =====")
 
 
 # ====================== 账号配置 ======================
@@ -539,4 +679,13 @@ AccountGroup = []
 
 if __name__ == "__main__":
     AccountGroup = build_account_group()
-    run_tick()
+    argv = sys.argv[1:]
+    if "--daemon" in argv:
+        max_minutes = None
+        if "--max-minutes" in argv:
+            idx = argv.index("--max-minutes")
+            if idx + 1 < len(argv):
+                max_minutes = int(argv[idx + 1])
+        run_daemon(max_minutes)
+    else:
+        run_tick()
