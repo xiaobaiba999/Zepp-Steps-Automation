@@ -3,11 +3,27 @@
   "accounts": {
     "322a89455926db15": {
       "date": "2026-10-20",
-      "run_count": 12,
-      "total_steps": 18455,
-      "next_run_ts": 1792503744.446594,
+      "run_count": 13,
+      "total_steps": 20489,
+      "next_run_ts": 1792510336.836275,
       "fail_count": 0,
-      "done": false
+      "done": false,
+      "plan": [
+        1735,
+        1063,
+        1560,
+        1897,
+        1902,
+        2026,
+        1993,
+        1245,
+        1424,
+        1449,
+        1165,
+        1209,
+        2034,
+        1395
+      ]
     }
   },
   "workday_cache": {
