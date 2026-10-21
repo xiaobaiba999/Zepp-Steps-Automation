@@ -6,8 +6,8 @@
       "run_count": 6,
       "total_steps": 8439,
       "next_run_ts": 1792579978.503851,
-      "fail_count": 4,
-      "done": false,
+      "fail_count": 5,
+      "done": true,
       "target": 19377,
       "plan": [
         1309,
