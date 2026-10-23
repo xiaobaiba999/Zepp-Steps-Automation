@@ -6,14 +6,24 @@ Zepp Life(原小米运动)微信步数自动化 · 分时段累加模式
 功能说明(总量增强版)
 --------
 每天从早上 6 点(北京时间)开始自动提交步数:
-  - 每天开始时先随机决定「当日目标总步数」: 15000 ~ 40000 之间的随机值
+  - 每天开始时先随机决定「当日目标总步数」: 25000 ~ 50000 之间的随机值
+    (抽取带向上偏置,大多数日子落在 34000~48000,不会贴着下限徘徊)
   - 工作日(周一至周五)拆成 14 份、休息日(周六日/法定节假日)拆成 10 份,
-    每份 ≈ 目标/次数 × 0.65~1.35 随机浮动,总和精确等于当日目标
-    (工作日单份约 700~3900、休息日单份约 1000~5400,随当日目标大小变化)
+    各份按「时段节律模板」分配(约均值的 0.7~1.5 倍浮动),总和精确等于当日目标
+    (工作日单份约 980~5540、休息日单份约 1400~7750,随当日目标大小变化)
   - 每次到点提交 = 上一次累计值 + 下一份,步数自然增长
   - 两次提交之间随机间隔 1~2 小时(次数多时会自动压缩间隔以保证当天完成)
-  - 当天次数全部提交完后,总步数必然落在 15000~40000 之间,
+  - 22:30 硬截止:当天全部提交保证在北京时间 22:30 前完成
+    (最后一次预约不晚于 22:00,22:25 后不再启动新的提交),夜间零提交
+  - 当天次数全部提交完后,总步数必然落在 25000~50000 之间,
     且每天目标不同,总量日间波动大、单次增量有起伏,更接近真人
+  - 目标平滑:今天目标在昨天基础上小幅漂移(向上略强于向下),
+    既模拟稳定的生活习惯,又保证整体保持高活动量不回落;
+    旧版低目标(低于当前下限)升级后直接跳出,当天即进入新区间
+  - 时段节律:各次提交量按「早间主峰 + 午后平稳 + 晚间收尾」模板分配,
+    午后 2 点前完成五至六成,白天看进度不吃亏,步数曲线也更像真人一天
+  - 登录态复用:长驻班次内多次提交共享一次登录(进程内缓存,不落盘),
+    每天对华米接口的请求数约降为原来的 1/3,减少风控暴露
 
 实现方式
 --------
@@ -29,7 +39,9 @@ GitHub Actions 有两个限制:
   4. 把新状态写回 state.json,并立刻由脚本自己 commit & push 回仓库;
   5. 若发现进度落后于当日均匀计划(说明之前的触发被 GitHub 跳过),
      脚本会自动连环补交(每轮间隔 1~2.5 分钟),确保当天次数完成;
-  6. 跨天后状态自动重置,重新从 6 点开始,如此往复。
+  6. 跨天后状态自动重置,重新从 6 点开始,如此往复;
+  7. 全天所有提交在 22:30 前完成(22:25 后不再启动新提交),
+     夜间班次仅维持接力链运转,次日 6 点自动开始新一轮。
 每天次数按「工作日/休息日」自动区分:优先调用免费节假日接口识别法定节假日
 与调休补班(可关闭),接口失败时回退为「周一至周五=工作日、周六日=休息日」。
 """
@@ -53,18 +65,21 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_START_HOUR = 6        # 每天开始提交的小时(北京时间,24 小时制)
 DEFAULT_WEEKDAY_RUNS = 14     # 工作日(周一至周五)每天提交次数
 DEFAULT_WEEKEND_RUNS = 10     # 休息日(周六日/法定节假日)每天提交次数
-DEFAULT_DAILY_MIN = 15000     # 每日总步数目标下限(每天先随机取目标,再拆分到各次)
-DEFAULT_DAILY_MAX = 40000     # 每日总步数目标上限
-PLAN_CHUNK_VARIANCE = (0.65, 1.35)   # 每份步数围绕平均值(目标/次数)的随机浮动区间
+DEFAULT_DAILY_MIN = 25000     # 每日总步数目标下限(每天先随机取目标,再拆分到各次)
+DEFAULT_DAILY_MAX = 50000     # 每日总步数目标上限
+DAILY_TARGET_BIAS_EXP = 0.5   # 目标抽取上偏指数:1=均匀,越小越偏向区间上限(0.5 时大多数日子落在区间上半段)
+PLAN_CHUNK_VARIANCE = (0.65, 1.35)   # 纯随机兑底拆分的权重浮动区间(节律模板固定用 0.55~1.55 倍均值硬界)
 DEFAULT_STEP_MIN = 1000       # 兜底:当日无计划时单次累加下限(正常流程用不到)
 DEFAULT_STEP_MAX = 2000       # 兜底:当日无计划时单次累加上限(正常流程用不到)
 DEFAULT_INTERVAL_MIN = 60     # 两次提交之间的最小间隔(分钟)
 DEFAULT_INTERVAL_MAX = 120    # 两次提交之间的最大间隔(分钟)
 
-# 说明:步数采用「每日目标制」——每天开始时随机决定当日总步数(15000~40000),
-# 再按次数随机拆分(总和精确等于目标);工作日 14 次无法在 6:00-23:40 内
-# 全部用满 1~2 小时间隔,脚本会按「剩余时间/剩余次数」自动压缩间隔
-# (约 60~100 分钟),保证当天次数与目标全部完成。
+# 说明:步数采用「每日目标制」——每天开始时随机决定当日总步数(25000~50000,
+# 抽取整体偏向上半段,大多数日子 34000~48000),再按次数随机拆分(总和精确等于
+# 目标);工作日 14 次无法在 6:00-22:30 内全部用满 1~2 小时间隔,脚本会按
+# 「剩余时间/剩余次数」自动压缩间隔(约 60~100 分钟),保证当天次数与目标
+# 全部完成,且 22:30 前收尾。夜间(22:30~次日 6:00)绝无任何提交,
+# 接力链班次仅保持链条运转。
 
 # ---- 法定节假日识别(用于区分工作日/休息日,可按需关闭) ----
 USE_HOLIDAY_API = True        # True=自动识别法定节假日与调休补班;失败自动回退按星期判断
@@ -75,15 +90,18 @@ HOLIDAY_OVERRIDES = {}
 
 RETRY_INTERVAL_MINUTES = 10   # 提交失败后的重试间隔(分钟)
 MAX_RETRY_PER_DAY = 5         # 单账号每日最大失败重试次数,超过则今日放弃
-DAY_END_HOUR = 23             # 当天最后一个可用唤醒点(北京时间 23:40,按自检周期),
-DAY_END_MINUTE = 40           # 间隔规划会预留完整槽位,确保当天次数全部完成
+DAY_END_HOUR = 22             # 当天硬截止:北京时间 22:30 后当天绝不再提交任何步数
+DAY_END_MINUTE = 30           # (全天任务保证在 22:30 前完成,夜间零提交)
 WAKE_TICK_MINUTES = 20        # 长驻模式内部自检周期(分钟),间隔规划会对齐到该周期
+DAY_END_PLAN_MARGIN_MINUTES = 30   # 排程提前量:最后一次提交的预约不晚于 22:00,
+                                   # 为"到点后最多等一个自检周期(20分钟)才被唤醒"留足余量
+DAY_END_GRACE_MINUTES = 5     # 提交启动门槛:22:25 起不再启动新的提交,给网络请求留出落地时间
 
 # ---- 断层补交(应对 GitHub Actions 定时调度被延迟/跳过) ----
 # 实测 GitHub 会把 */20 的 cron 大幅延迟甚至整批跳过,预约时间常无人唤醒。
 # 补交逻辑:提交后若按当日均匀计划计算进度仍落后,就在本轮继续连环补交。
 CATCHUP_GRACE_MINUTES = 15        # 进度落后超过该分钟数才判定为落后(避免正常抖动触发)
-CATCHUP_MAX_ROUNDS = 4            # 单次自检最多连环补交轮数(防止一次补太密)
+CATCHUP_MAX_ROUNDS = 6            # 单次自检最多连环补交轮数(落后较多时可更快追平,仍防一次补太密)
 CATCHUP_SLEEP_RANGE = (60, 150)   # 补交轮之间的随机间隔(秒),模拟自然的连续活动
 DAEMON_MAX_MINUTES = 330          # 长驻模式单次最长运行时长(分钟),需小于 Job 的 6 小时上限
 
@@ -99,6 +117,12 @@ SELF_DISPATCH_MAX_RETRY = 3       # 接力触发失败时的重试次数
 SELF_DISPATCH_RETRY_SLEEP = 5     # 接力触发重试间隔(秒)
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+# ---- 登录态缓存(进程内,不落盘) ----
+# 长驻班次内多次提交复用同一次登录,减少对华米接口的请求次数(降低风控暴露)。
+# 只存内存:state.json 会被 commit 回公开仓库,绝不能写入任何凭证。
+AUTH_TTL_SECONDS = 4 * 3600    # 登录态缓存有效期(秒),过期后重新登录
+_AUTH_CACHE = {}               # {account: {"user_id","app_token","ts"}}
 
 BJ_TZ = timezone(timedelta(hours=8))   # 北京时间(UTC+8,无夏令时)
 
@@ -328,16 +352,39 @@ def save_state(state):
 
 
 def submit_steps(account, password, steps):
-    """登录并提交一次步数;成功返回 True"""
-    login_token, userid = login(account, password)
-    if not login_token:
-        print(f"错误:账号:{account},登录失败")
-        return False
-    app_token = get_app_token(login_token)
+    """登录并提交一次步数;成功返回 True。
+    登录态(app_token)在进程内缓存(AUTH_TTL_SECONDS 内复用):长驻班次里
+    多次提交共享一次登录,把每天对华米接口的请求数降到约 1/3,减少风控暴露。
+    注意:缓存只存进程内存,绝不写入 state.json(state.json 会被推送回公开仓库)。
+    提交失败时视为缓存可能过期:清缓存重新登录再试一次,仍失败才向上报失败。"""
+    cached = _AUTH_CACHE.get(account)
+    now_ts = time.time()
+    user_id = app_token = None
+    if cached and now_ts - cached["ts"] < AUTH_TTL_SECONDS:
+        user_id, app_token = cached["user_id"], cached["app_token"]
     if not app_token:
-        print(f"错误:账号:{account},获取 app_token 失败")
-        return False
-    return change_steps(account, userid, app_token, str(steps))
+        login_token, user_id = login(account, password)
+        if not login_token:
+            print(f"错误:账号:{account},登录失败")
+            return False
+        app_token = get_app_token(login_token)
+        if not app_token:
+            print(f"错误:账号:{account},获取 app_token 失败")
+            return False
+    ok = change_steps(account, user_id, app_token, str(steps))
+    if not ok:
+        login_token, user_id2 = login(account, password)
+        if login_token:
+            app_token2 = get_app_token(login_token)
+            if app_token2:
+                ok = change_steps(account, user_id2, app_token2, str(steps))
+                if ok:
+                    user_id, app_token = user_id2, app_token2
+    if ok:
+        _AUTH_CACHE[account] = {"user_id": user_id, "app_token": app_token, "ts": now_ts}
+    else:
+        _AUTH_CACHE.pop(account, None)
+    return ok
 
 
 def query_holiday_api(date_str):
@@ -393,43 +440,126 @@ def get_runs_for_date(cfg, date_str, state):
     return int(cfg["weekday_runs"])
 
 
-def build_day_plan(cfg, date_str, state):
-    """生成当日步数计划:先随机定目标(15000~40000),再按当日次数随机拆分。
+def draw_daily_target(lo, hi):
+    """随机抽取今日目标(上偏):u**0.5 使目标整体偏向区间上半段
+    (期望约在区间的 2/3 处,约 96% 的日子不低于区间下限+20%),
+    避免目标长期贴着下限徘徊。"""
+    u = random.random() ** DAILY_TARGET_BIAS_EXP
+    return int(lo + (hi - lo) * u)
+
+
+def build_day_plan(cfg, date_str, state, prev_target=None):
+    """生成当日步数计划:先定目标,再按当日次数随机拆分。
+    目标确定策略:
+      - 有昨日目标且仍在当前区间内时,在昨日基础上小幅漂移
+        (向上略强于向下,生活习惯平滑又整体保持高活动量);
+      - 无昨日目标,或昨日目标已不在当前区间(如从旧版 15000 下限升级)
+        时,直接按上偏方式重新抽取,升级当天即进入新区间。
     返回 (target, plan);plan 为每次应提交的步数增量列表,总和精确等于 target,
     因此全天提交完后总步数必然落在 [daily_min, daily_max] 区间内。"""
     runs = get_runs_for_date(cfg, date_str, state)
-    target = random.randint(int(cfg["daily_min"]), int(cfg["daily_max"]))
+    lo, hi = int(cfg["daily_min"]), int(cfg["daily_max"])
+    if prev_target:
+        try:
+            prev_target = int(prev_target)
+        except (TypeError, ValueError):
+            prev_target = None
+    if prev_target and lo <= prev_target <= hi:
+        drift = random.uniform(-0.20, 0.26) * (hi - lo)   # 上偏漂移:日均约 +750 步
+        target = max(lo, min(hi, int(prev_target + drift)))
+        print(f"信息:目标平滑:昨日目标 {prev_target} 步,今日目标 {target} 步(漂移 {int(target - prev_target):+d})")
+    else:
+        target = draw_daily_target(lo, hi)
+        if prev_target:
+            print(f"信息:昨日目标 {prev_target} 步已不在当前区间 [{lo},{hi}],重新抽取今日目标 {target} 步")
     return target, split_daily_target(target, runs)
+
+
+# 时段节律模板:真人一天的步数增长不是均匀的——早间通勤/晨练是全天主峰之一,
+# 午间与午后保持较高活动量(按提交序前 8/5 次约占全天六成,叠加补交钳制后
+# 午后 2 点前实际完成五至六成,白天看进度不吃亏),傍晚起逐步收尾、深夜最少。模板权重下标对应当日第 k 次提交
+# (提交间隔均匀铺满全天,第 k 次 ≈ 全天进度 k/n 处),权重和为 1,
+# 叠加 ±10% 噪声后各份仍稳落在均值的 0.55~1.55 倍硬界内,不会触发回退。
+SLOT_TEMPLATES = {
+    14: [0.085, 0.095, 0.070, 0.065, 0.075, 0.070, 0.075, 0.085, 0.085, 0.075, 0.060, 0.055, 0.055, 0.050],
+    10: [0.100, 0.115, 0.095, 0.095, 0.105, 0.110, 0.095, 0.100, 0.095, 0.090],
+}
 
 
 def split_daily_target(target, n):
     """把目标步数随机拆成 n 份,总和精确等于 target。
-    每份限制在平均值(target/n)的 0.55~1.55 倍之间:有自然起伏,
-    但不会出现离谱的暴增/暴跌。返回整数列表。"""
+    优先按「时段节律模板」分配(通勤小峰 + 傍晚主峰 + ±10% 噪声),
+    更接近真人一天的步数曲线;模板不适用(自定义次数)或反复撞界时
+    退回纯随机拆分。每份均限制在平均值(target/n)的 0.55~1.55 倍内。"""
     avg = target / n
     lo, hi = max(1, int(avg * 0.55)), int(avg * 1.55) + 1
-    for _ in range(200):   # 拒绝采样:实测接受率极高,几乎首中
+
+    def _finalize(chunks):
+        # 舍入余数分摊到随机份数上(带上下界保护),保证总和精确等于 target
+        diff = target - sum(chunks)
+        guard = 0
+        while diff != 0 and guard < 100000:
+            i = random.randrange(n)
+            if diff > 0 and chunks[i] < hi:
+                chunks[i] += 1
+                diff -= 1
+            elif diff < 0 and chunks[i] > lo:
+                chunks[i] -= 1
+                diff += 1
+            guard += 1
+        return chunks if sum(chunks) == target else None
+
+    tpl = SLOT_TEMPLATES.get(n)
+    if tpl:
+        for _ in range(200):
+            w = [x * random.uniform(0.9, 1.1) for x in tpl]
+            s = sum(w)
+            chunks = [int(round(target * x / s)) for x in w]
+            if all(lo <= c <= hi for c in chunks):
+                result = _finalize(chunks)
+                if result:
+                    return result
+    for _ in range(200):   # 兜底:纯随机拆分(拒绝采样)
         weights = [random.uniform(0.65, 1.35) for _ in range(n)]
         s = sum(weights)
         chunks = [int(round(target * w / s)) for w in weights]
         if sum(chunks) == target and all(lo <= c <= hi for c in chunks):
             return chunks
-    base = target // n     # 兜底:等分 + 余数,保证总和精确
+    base = target // n     # 最终兜底:等分 + 余数,保证总和精确
     chunks = [base] * n
     for i in range(target - base * n):
         chunks[i] += 1
     return chunks
 
 
+def day_deadline(now):
+    """当天硬截止时刻(北京时间 22:30):此后当天绝不再提交任何步数。"""
+    return now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+
+
+def day_plan_deadline(now):
+    """当天排程截止(硬截止 - 排程提前量 = 22:00):最后一次提交的预约不晚于该时刻。
+    预约到点后最多等一个自检周期(20 分钟)才被下一次自检唤醒,提前量保证
+    即使等满一个周期,提交仍能在 22:30 硬截止前完成。"""
+    return day_deadline(now) - timedelta(minutes=DAY_END_PLAN_MARGIN_MINUTES)
+
+
+def day_gate_deadline(now):
+    """当天提交启动门槛(硬截止 - 提交宽限 = 22:25):晚于该时刻不再启动新的提交,
+    给提交请求本身留出落地时间,确保实际写入在 22:30 前完成。"""
+    return day_deadline(now) - timedelta(minutes=DAY_END_GRACE_MINUTES)
+
+
 def plan_next_wait_minutes(now, remaining_runs, cfg):
     """生成两次提交之间的随机等待分钟数(1~2 小时,对齐自检周期);
-    若剩余次数在当天排不完(如工作日 14 次),则按「最后一个可用唤醒点 -
-    剩余次数 x 自检周期」自动压缩间隔,保证剩余每一次都有可用槽位"""
+    若剩余次数在当天排不完(如工作日 14 次),则按「排程截止点(22:00) -
+    剩余次数 x 自检周期」自动压缩间隔,保证剩余每一次都有可用槽位,
+    且全部落在 22:30 硬截止之前"""
     base = random.randint(cfg["interval_min"], cfg["interval_max"])
     wait = max(1, -(-base // WAKE_TICK_MINUTES)) * WAKE_TICK_MINUTES   # 对齐到自检周期整数倍
-    # 当天最后一个可用唤醒点之前,必须给剩余每一次都留出槽位
-    day_end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-    latest_next = day_end - (remaining_runs - 1) * timedelta(minutes=WAKE_TICK_MINUTES)
+    # 排程截止点之前,必须给剩余每一次都留出槽位
+    plan_end = day_plan_deadline(now)
+    latest_next = plan_end - (remaining_runs - 1) * timedelta(minutes=WAKE_TICK_MINUTES)
     max_wait = (latest_next - now).total_seconds() / 60
     if max_wait < wait:
         wait = max(WAKE_TICK_MINUTES, int(max_wait // WAKE_TICK_MINUTES) * WAKE_TICK_MINUTES)
@@ -438,14 +568,14 @@ def plan_next_wait_minutes(now, remaining_runs, cfg):
 
 def is_behind_schedule(now, run_count, today_runs, cfg):
     """判断当前完成进度是否落后于当日均匀计划(用于唤醒断层后连环补交)。
-    计划:从 start_hour 到当天截止点,today_runs 次提交均匀分布,
+    计划:从 start_hour 到当天排程截止点(22:00),today_runs 次提交均匀分布,
     第 run_count 次应完成的时刻 = start + 全程时长 x run_count / today_runs。
     若当前时间已超过该时刻 CATCHUP_GRACE_MINUTES 分钟以上,视为落后。"""
     if run_count >= today_runs:
         return False
     start = now.replace(hour=cfg["start_hour"], minute=0, second=0, microsecond=0)
-    day_end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-    total = (day_end - start).total_seconds()
+    plan_end = day_plan_deadline(now)
+    total = (plan_end - start).total_seconds()
     if total <= 0:
         return False
     slot = start + timedelta(seconds=total * run_count / today_runs)
@@ -466,7 +596,7 @@ def process_account(account, password, cfg, state, now):
 
     # 新账号或跨天:重置当日状态,并生成当日步数计划(随机目标 + 拆分)
     if entry is None or entry.get("date") != today:
-        target, plan = build_day_plan(cfg, today, state)
+        target, plan = build_day_plan(cfg, today, state, prev_target=(entry or {}).get("target"))
         entry = {
             "date": today,
             "run_count": 0,       # 今日已提交次数
@@ -474,7 +604,7 @@ def process_account(account, password, cfg, state, now):
             "next_run_ts": 0,     # 下次提交预约时间(Unix 秒级时间戳)
             "fail_count": 0,      # 今日连续失败次数
             "done": False,        # 今日是否已全部完成
-            "target": target,     # 今日目标总步数(15000~40000 之间)
+            "target": target,     # 今日目标总步数(25000~50000 之间)
             "plan": plan,         # 每次提交的步数拆分(总和 = target)
         }
         entries[key] = entry
@@ -515,6 +645,21 @@ def process_account(account, password, cfg, state, now):
     rounds = 0          # 本次自检已连环补交的轮数
     catchup = False     # 补交模式:跳过预约检查,直接连续提交追平进度
 
+    # 升级过渡:当日计划还是旧版低区间(目标低于当前下限)生成的,
+    # 立即按新区间重排「剩余次数」的计划,升级当天就能看到总量提升
+    if entry.get("target") and int(entry["target"]) < int(cfg["daily_min"]) \
+            and entry["run_count"] < today_runs:
+        old_target = int(entry["target"])
+        new_target = max(draw_daily_target(int(cfg["daily_min"]), int(cfg["daily_max"])),
+                         entry["total_steps"] + (today_runs - entry["run_count"]))
+        rem_plan = split_daily_target(new_target - entry["total_steps"],
+                                      today_runs - entry["run_count"])
+        entry["plan"] = list((entry.get("plan") or [])[:entry["run_count"]]) + rem_plan
+        entry["target"] = new_target
+        print(f"信息:账号:{tag},升级过渡:今日目标 {old_target} -> {new_target} 步,"
+              f"剩余 {today_runs - entry['run_count']} 次已按新区间重新拆分"
+              f"(每份约 {min(rem_plan)}~{max(rem_plan)} 步)")
+
     while True:
         if now.hour < cfg["start_hour"]:
             print(f"信息:账号:{tag},未到每日开始时间({cfg['start_hour']}点),本次跳过")
@@ -523,6 +668,19 @@ def process_account(account, password, cfg, state, now):
         if entry["run_count"] >= today_runs:
             entry["done"] = True
             print(f"信息:账号:{tag},今日{today_runs}次提交已全部完成,累计{entry['total_steps']}步")
+            return submitted
+
+        # 22:30 硬截止:过了提交启动门槛(22:25)仍有剩余次数时,放弃今日剩余部分,
+        # 绝不在截止后提交;次日自检会自动重置并生成新计划。
+        # 门槛前仍会尽力补交:22:20 在班的班次还可在 22:25 前连环补上最后几次
+        gate = day_gate_deadline(now)
+        if now >= gate:
+            remain = today_runs - entry["run_count"]
+            entry["done"] = True
+            entry["next_run_ts"] = 0
+            print(f"警告:账号:{tag},已过当天提交门槛({gate:%H:%M},硬截止 "
+                  f"{DAY_END_HOUR:02d}:{DAY_END_MINUTE:02d}),今日剩余 {remain} 次不再提交"
+                  f"(累计 {entry['total_steps']} 步),次日自动重置")
             return submitted
 
         next_ts = entry.get("next_run_ts") or 0
@@ -538,7 +696,7 @@ def process_account(account, password, cfg, state, now):
         plan = entry.get("plan") or []
         if len(plan) < today_runs:
             # 旧状态文件无当日计划(升级过渡期):现定目标并拆分,剩余次数继续沿用
-            tgt = random.randint(int(cfg["daily_min"]), int(cfg["daily_max"]))
+            tgt = draw_daily_target(int(cfg["daily_min"]), int(cfg["daily_max"]))
             plan = split_daily_target(tgt, today_runs)
             entry["plan"] = plan
             print(f"信息:账号:{tag},当日无完整步数计划(升级过渡),现生成:目标 {tgt} 步/{today_runs} 次")
@@ -706,9 +864,10 @@ def dispatch_next_run():
 
 
 def _daemon_can_exit():
-    """当日所有账号任务完成,且已超过当天最后可用唤醒点(23:40)时允许提前退出"""
+    """当日所有账号任务完成(含 22:30 硬截止后放弃剩余),且已过硬截止点(22:30)
+    时允许提前退出,由接力链触发下一班接管夜间空闲时段"""
     now = datetime.now(BJ_TZ)
-    if (now.hour, now.minute) < (DAY_END_HOUR, DAY_END_MINUTE):
+    if now < day_deadline(now):
         return False
     state = load_state()
     today = now.strftime("%F")
@@ -730,7 +889,10 @@ def run_daemon(max_minutes=None, tick_minutes=None):
     每天只需 4 个大致准点的触发窗口,窗口内到点提交、错过则自动补交。"""
     max_minutes = int(max_minutes or DAEMON_MAX_MINUTES)
     tick_minutes = int(tick_minutes or WAKE_TICK_MINUTES)
-    print(f"===== 进入长驻模式:每 {tick_minutes} 分钟自检一次,最长运行 {max_minutes} 分钟 =====")
+    evt = os.environ.get("GITHUB_EVENT_NAME", "")
+    src_name = {"workflow_dispatch": "接力链触发", "schedule": "cron 定时兜底"}.get(
+        evt, f"本地/手动({evt or '无事件标识'})")
+    print(f"===== 进入长驻模式(触发来源:{src_name}):每 {tick_minutes} 分钟自检一次,最长运行 {max_minutes} 分钟 =====")
     deadline = time.time() + max_minutes * 60
 
     while True:
@@ -767,7 +929,7 @@ def build_account_group():
         # 每行格式: [账号, 密码, 步数配置]
         # 第三个元素(步数配置)的取值:
         #   None            -> 全局默认(分时段累加):每天 6 点开始,每 1~2 小时随机提交一次;
-        #                      每日总步数随机 15000~40000,工作日(周一至周五)14 次,休息日 10 次
+        #                      每日总步数随机 25000~50000(偏向上半段),工作日(周一至周五)14 次,休息日 10 次
         #   dict            -> 自定义参数,可选字段:
         #                      start_hour(开始小时) / weekday_runs(工作日次数) /
         #                      weekend_runs(休息日次数) / runs_per_day(每天固定次数,优先级最高) /
