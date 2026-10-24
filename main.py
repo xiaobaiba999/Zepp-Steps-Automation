@@ -6,20 +6,20 @@ Zepp Life(原小米运动)微信步数自动化 · 分时段累加模式
 功能说明(总量增强版)
 --------
 每天从早上 6 点(北京时间)开始自动提交步数:
-  - 每天开始时先随机决定「当日目标总步数」: 25000 ~ 50000 之间的随机值
-    (抽取带向上偏置,大多数日子落在 34000~48000,不会贴着下限徘徊)
+  - 每天开始时先随机决定「当日目标总步数」: 22000 ~ 34661 之间的随机值
+    (抽取带向上偏置,大多数日子落在 26000~34000,不会贴着下限徘徊)
   - 工作日(周一至周五)拆成 14 份、休息日(周六日/法定节假日)拆成 10 份,
     各份按「时段节律模板」分配(约均值的 0.7~1.5 倍浮动),总和精确等于当日目标
-    (工作日单份约 980~5540、休息日单份约 1400~7750,随当日目标大小变化)
+    (工作日单份约 860~3840、休息日单份约 1210~5372,随当日目标大小变化)
   - 每次到点提交 = 上一次累计值 + 下一份,步数自然增长
   - 两次提交之间随机间隔 1~2 小时(次数多时会自动压缩间隔以保证当天完成)
   - 22:30 硬截止:当天全部提交保证在北京时间 22:30 前完成
     (最后一次预约不晚于 22:00,22:25 后不再启动新的提交),夜间零提交
-  - 当天次数全部提交完后,总步数必然落在 25000~50000 之间,
+  - 当天次数全部提交完后,总步数必然落在 22000~34661 之间,
     且每天目标不同,总量日间波动大、单次增量有起伏,更接近真人
   - 目标平滑:今天目标在昨天基础上小幅漂移(向上略强于向下),
     既模拟稳定的生活习惯,又保证整体保持高活动量不回落;
-    旧版低目标(低于当前下限)升级后直接跳出,当天即进入新区间
+    旧目标(低于下限或高于上限)升级后直接跳出,当天即进入新区间
   - 时段节律:各次提交量按「早间主峰 + 午后平稳 + 晚间收尾」模板分配,
     午后 2 点前完成五至六成,白天看进度不吃亏,步数曲线也更像真人一天
   - 登录态复用:长驻班次内多次提交共享一次登录(进程内缓存,不落盘),
@@ -65,8 +65,8 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_START_HOUR = 6        # 每天开始提交的小时(北京时间,24 小时制)
 DEFAULT_WEEKDAY_RUNS = 14     # 工作日(周一至周五)每天提交次数
 DEFAULT_WEEKEND_RUNS = 10     # 休息日(周六日/法定节假日)每天提交次数
-DEFAULT_DAILY_MIN = 25000     # 每日总步数目标下限(每天先随机取目标,再拆分到各次)
-DEFAULT_DAILY_MAX = 50000     # 每日总步数目标上限
+DEFAULT_DAILY_MIN = 22000     # 每日总步数目标下限(每天先随机取目标,再拆分到各次)
+DEFAULT_DAILY_MAX = 34661     # 每日总步数目标上限(按需可改回整数如 35000)
 DAILY_TARGET_BIAS_EXP = 0.5   # 目标抽取上偏指数:1=均匀,越小越偏向区间上限(0.5 时大多数日子落在区间上半段)
 PLAN_CHUNK_VARIANCE = (0.65, 1.35)   # 纯随机兑底拆分的权重浮动区间(节律模板固定用 0.55~1.55 倍均值硬界)
 DEFAULT_STEP_MIN = 1000       # 兜底:当日无计划时单次累加下限(正常流程用不到)
@@ -74,8 +74,8 @@ DEFAULT_STEP_MAX = 2000       # 兜底:当日无计划时单次累加上限(正�
 DEFAULT_INTERVAL_MIN = 60     # 两次提交之间的最小间隔(分钟)
 DEFAULT_INTERVAL_MAX = 120    # 两次提交之间的最大间隔(分钟)
 
-# 说明:步数采用「每日目标制」——每天开始时随机决定当日总步数(25000~50000,
-# 抽取整体偏向上半段,大多数日子 34000~48000),再按次数随机拆分(总和精确等于
+# 说明:步数采用「每日目标制」——每天开始时随机决定当日总步数(22000~34661,
+# 抽取整体偏向上半段,大多数日子 26000~34000),再按次数随机拆分(总和精确等于
 # 目标);工作日 14 次无法在 6:00-22:30 内全部用满 1~2 小时间隔,脚本会按
 # 「剩余时间/剩余次数」自动压缩间隔(约 60~100 分钟),保证当天次数与目标
 # 全部完成,且 22:30 前收尾。夜间(22:30~次日 6:00)绝无任何提交,
@@ -604,7 +604,7 @@ def process_account(account, password, cfg, state, now):
             "next_run_ts": 0,     # 下次提交预约时间(Unix 秒级时间戳)
             "fail_count": 0,      # 今日连续失败次数
             "done": False,        # 今日是否已全部完成
-            "target": target,     # 今日目标总步数(25000~50000 之间)
+            "target": target,     # 今日目标总步数(22000~34661 之间)
             "plan": plan,         # 每次提交的步数拆分(总和 = target)
         }
         entries[key] = entry
@@ -645,20 +645,31 @@ def process_account(account, password, cfg, state, now):
     rounds = 0          # 本次自检已连环补交的轮数
     catchup = False     # 补交模式:跳过预约检查,直接连续提交追平进度
 
-    # 升级过渡:当日计划还是旧版低区间(目标低于当前下限)生成的,
-    # 立即按新区间重排「剩余次数」的计划,升级当天就能看到总量提升
-    if entry.get("target") and int(entry["target"]) < int(cfg["daily_min"]) \
-            and entry["run_count"] < today_runs:
-        old_target = int(entry["target"])
-        new_target = max(draw_daily_target(int(cfg["daily_min"]), int(cfg["daily_max"])),
-                         entry["total_steps"] + (today_runs - entry["run_count"]))
-        rem_plan = split_daily_target(new_target - entry["total_steps"],
-                                      today_runs - entry["run_count"])
+    # 升级/调参过渡:当日计划的目标已不在当前区间时,重排「剩余次数」:
+    #   - 低于新下限(如旧版 15000) -> 按新区间上偏重抽,把今日总量拉上去;
+    #   - 高于新上限(如下调区间) -> 已提交部分无法收回,剩余次数只给极小增量,
+    #     今日尽量封顶在上限附近,次日起严格落在新区间内
+    t_now = int(entry.get("target") or 0)
+    lo_now, hi_now = int(cfg["daily_min"]), int(cfg["daily_max"])
+    if t_now and (t_now < lo_now or t_now > hi_now) and entry["run_count"] < today_runs:
+        remain = today_runs - entry["run_count"]
+        total_now = entry["total_steps"]
+        if t_now < lo_now:
+            new_target = max(draw_daily_target(lo_now, hi_now), total_now + remain)
+            rem_plan = split_daily_target(new_target - total_now, remain)
+            action = f"提升到 {new_target}"
+        else:
+            rem_amt = max(hi_now - total_now, remain)
+            if hi_now > total_now:
+                rem_plan = split_daily_target(rem_amt, remain)
+            else:   # 已超上限:剩余次数每份只加 1~50 步,今日基本不再上涨
+                rem_plan = [random.randint(1, 50) for _ in range(remain)]
+            new_target = total_now + sum(rem_plan)
+            action = f"封顶在约 {new_target}"
         entry["plan"] = list((entry.get("plan") or [])[:entry["run_count"]]) + rem_plan
         entry["target"] = new_target
-        print(f"信息:账号:{tag},升级过渡:今日目标 {old_target} -> {new_target} 步,"
-              f"剩余 {today_runs - entry['run_count']} 次已按新区间重新拆分"
-              f"(每份约 {min(rem_plan)}~{max(rem_plan)} 步)")
+        print(f"信息:账号:{tag},过渡重排:今日目标 {t_now} -> {action},"
+              f"剩余 {remain} 次已重新拆分(每份约 {min(rem_plan)}~{max(rem_plan)} 步)")
 
     while True:
         if now.hour < cfg["start_hour"]:
@@ -929,7 +940,7 @@ def build_account_group():
         # 每行格式: [账号, 密码, 步数配置]
         # 第三个元素(步数配置)的取值:
         #   None            -> 全局默认(分时段累加):每天 6 点开始,每 1~2 小时随机提交一次;
-        #                      每日总步数随机 25000~50000(偏向上半段),工作日(周一至周五)14 次,休息日 10 次
+        #                      每日总步数随机 22000~34661(偏向上半段),工作日(周一至周五)14 次,休息日 10 次
         #   dict            -> 自定义参数,可选字段:
         #                      start_hour(开始小时) / weekday_runs(工作日次数) /
         #                      weekend_runs(休息日次数) / runs_per_day(每天固定次数,优先级最高) /
