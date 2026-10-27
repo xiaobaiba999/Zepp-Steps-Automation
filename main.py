@@ -3,11 +3,16 @@
 Zepp Life(原小米运动)微信步数自动化 · 分时段累加模式
 ====================================================
 
-功能说明(总量增强版)
+功能说明(分阶段权重版)
 --------
 每天从早上 6 点(北京时间)开始自动提交步数:
-  - 每天开始时先随机决定「当日目标总步数」: 22000 ~ 34661 之间的随机值
-    (抽取带向上偏置,大多数日子落在 26000~34000,不会贴着下限徘徊)
+  - 每天开始时先按 DAILY_PHASES 的权重抽「今日阶段」:轻松日/常规日/活跃日,
+    再在该阶段自己的步数带内随机决定当日目标;三个带合起来正好覆盖
+    22000~34661,无论抽到哪个阶段都绝不超过 34661
+  - 今日有 PHASE_STICKINESS(默认 55%)的概率直接延续昨日阶段(叠加重新抽取
+    仍可能落在同档,实际同档概率约 3/4),形成 2~4 天的
+    「连轻松 / 连常规 / 连活跃」小波次;切换阶段时目标跳档
+    (带与带之间留有空隙),告别"每天都是三万多"的固定感,更像真人忙闲交替
   - 工作日(周一至周五)拆成 14 份、休息日(周六日/法定节假日)拆成 10 份,
     各份按「时段节律模板」分配(约均值的 0.7~1.5 倍浮动),总和精确等于当日目标
     (工作日单份约 860~3840、休息日单份约 1210~5372,随当日目标大小变化)
@@ -16,10 +21,9 @@ Zepp Life(原小米运动)微信步数自动化 · 分时段累加模式
   - 22:30 硬截止:当天全部提交保证在北京时间 22:30 前完成
     (最后一次预约不晚于 22:00,22:25 后不再启动新的提交),夜间零提交
   - 当天次数全部提交完后,总步数必然落在 22000~34661 之间,
-    且每天目标不同,总量日间波动大、单次增量有起伏,更接近真人
-  - 目标平滑:今天目标在昨天基础上小幅漂移(向上略强于向下),
-    既模拟稳定的生活习惯,又保证整体保持高活动量不回落;
-    旧目标(低于下限或高于上限)升级后直接跳出,当天即进入新区间
+    单次增量有起伏、日间有跳档,更接近真人
+  - 同阶段目标平滑:与昨日同阶段时,目标在阶段带内小幅漂移(±28% 带宽),
+    同档内不大起大落;阶段切换或昨日目标越界(升级/改配置)时,直接在新带内重抽
   - 时段节律:各次提交量按「早间主峰 + 午后平稳 + 晚间收尾」模板分配,
     午后 2 点前完成五至六成,白天看进度不吃亏,步数曲线也更像真人一天
   - 登录态复用:长驻班次内多次提交共享一次登录(进程内缓存,不落盘),
@@ -65,18 +69,31 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_START_HOUR = 6        # 每天开始提交的小时(北京时间,24 小时制)
 DEFAULT_WEEKDAY_RUNS = 14     # 工作日(周一至周五)每天提交次数
 DEFAULT_WEEKEND_RUNS = 10     # 休息日(周六日/法定节假日)每天提交次数
-DEFAULT_DAILY_MIN = 22000     # 每日总步数目标下限(每天先随机取目标,再拆分到各次)
-DEFAULT_DAILY_MAX = 34661     # 每日总步数目标上限(按需可改回整数如 35000)
-DAILY_TARGET_BIAS_EXP = 0.5   # 目标抽取上偏指数:1=均匀,越小越偏向区间上限(0.5 时大多数日子落在区间上半段)
+DEFAULT_DAILY_MIN = 22000     # 每日总步数目标下限(所有阶段步数带共同的统一下限)
+DEFAULT_DAILY_MAX = 34661     # 每日总步数目标上限(任何阶段抽出的目标都不会超过它)
+DAILY_TARGET_BIAS_EXP = 0.8   # 阶段带内目标抽取偏置:1=带内均匀,越小越偏向阶段带上缘
+
+# ---- 每日阶段权重(v7 新增:打破"每天都是三万多"的固定感) ----
+# 每天先按权重随机抽一个「阶段」,再在该阶段自己的步数带内抽当日目标:
+#   (出现权重, 带下限, 带上限, 阶段名)
+# 想让某类日子更常出现就调大它的权重;带与带之间刻意留了空隙,跳档一眼可辨;
+# 三个带合并起来正好覆盖 DEFAULT_DAILY_MIN ~ DEFAULT_DAILY_MAX 整个区间。
+DAILY_PHASES = [
+    (3.0, 22000, 26400, "轻松日"),   # 约 33% 的日子:2.20 万~2.64 万
+    (4.0, 27600, 31400, "常规日"),   # 约 43% 的日子:2.76 万~3.14 万
+    (2.2, 32400, 34661, "活跃日"),   # 约 24% 的日子:3.24 万~34661(贴近上限)
+]
+PHASE_STICKINESS = 0.55       # 直接延续昨日阶段的概率(叠加重抽同档后,实际同档概率约 3/4,形成 2~4 天波次)
 PLAN_CHUNK_VARIANCE = (0.65, 1.35)   # 纯随机兑底拆分的权重浮动区间(节律模板固定用 0.55~1.55 倍均值硬界)
 DEFAULT_STEP_MIN = 1000       # 兜底:当日无计划时单次累加下限(正常流程用不到)
 DEFAULT_STEP_MAX = 2000       # 兜底:当日无计划时单次累加上限(正常流程用不到)
 DEFAULT_INTERVAL_MIN = 60     # 两次提交之间的最小间隔(分钟)
 DEFAULT_INTERVAL_MAX = 120    # 两次提交之间的最大间隔(分钟)
 
-# 说明:步数采用「每日目标制」——每天开始时随机决定当日总步数(22000~34661,
-# 抽取整体偏向上半段,大多数日子 26000~34000),再按次数随机拆分(总和精确等于
-# 目标);工作日 14 次无法在 6:00-22:30 内全部用满 1~2 小时间隔,脚本会按
+# 说明:步数采用「每日目标制 + 分阶段权重」——每天开始时先按权重抽今日阶段
+# (轻松/常规/活跃,约 3/4 概率与昨天同档形成波次),再在该阶段自己的步数带内
+# 随机决定当日总步数(三个带合并 = 22000~34661),再按次数随机拆分(总和精确
+# 等于目标);工作日 14 次无法在 6:00-22:30 内全部用满 1~2 小时间隔,脚本会按
 # 「剩余时间/剩余次数」自动压缩间隔(约 60~100 分钟),保证当天次数与目标
 # 全部完成,且 22:30 前收尾。夜间(22:30~次日 6:00)绝无任何提交,
 # 接力链班次仅保持链条运转。
@@ -440,23 +457,52 @@ def get_runs_for_date(cfg, date_str, state):
     return int(cfg["weekday_runs"])
 
 
-def draw_daily_target(lo, hi):
-    """随机抽取今日目标(上偏):u**0.5 使目标整体偏向区间上半段
-    (期望约在区间的 2/3 处,约 96% 的日子不低于区间下限+20%),
-    避免目标长期贴着下限徘徊。"""
+def normalize_phases(daily_min, daily_max):
+    """把 DAILY_PHASES 裁剪到 [daily_min, daily_max] 内并剔除放不下的空带。
+    返回 [{weight, lo, hi, name}];全部带都放不进时退回整区间单阶段。"""
+    phases = []
+    for item in DAILY_PHASES:
+        w, plo, phi = float(item[0]), int(item[1]), int(item[2])
+        name = item[3] if len(item) > 3 else f"阶段{len(phases) + 1}"
+        plo, phi = max(plo, int(daily_min)), min(phi, int(daily_max))
+        if w > 0 and phi > plo:
+            phases.append({"weight": w, "lo": plo, "hi": phi, "name": name})
+    if not phases:
+        phases = [{"weight": 1.0, "lo": int(daily_min), "hi": int(daily_max), "name": "默认"}]
+    return phases
+
+
+def pick_phase(phases, prev_phase=None):
+    """按权重随机抽取今日阶段下标;prev_phase 有效时以 PHASE_STICKINESS 的
+    概率直接延续昨日阶段(形成 2~4 天的「连轻松/连常规/连活跃」波次)。"""
+    if (prev_phase is not None and 0 <= int(prev_phase) < len(phases)
+            and random.random() < PHASE_STICKINESS):
+        return int(prev_phase)
+    u = random.uniform(0, sum(p["weight"] for p in phases))
+    acc = 0.0
+    for i, p in enumerate(phases):
+        acc += p["weight"]
+        if u <= acc:
+            return i
+    return len(phases) - 1
+
+
+def draw_phase_target(phase):
+    """在阶段自己的步数带内抽取今日目标(带内带一点上偏,
+    DAILY_TARGET_BIAS_EXP=1 时为带内均匀)。"""
     u = random.random() ** DAILY_TARGET_BIAS_EXP
-    return int(lo + (hi - lo) * u)
+    return int(phase["lo"] + (phase["hi"] - phase["lo"]) * u)
 
 
-def build_day_plan(cfg, date_str, state, prev_target=None):
-    """生成当日步数计划:先定目标,再按当日次数随机拆分。
+def build_day_plan(cfg, date_str, state, prev_target=None, prev_phase=None):
+    """生成当日步数计划:先抽今日阶段,再在阶段带内定目标,最后按当日次数拆分。
     目标确定策略:
-      - 有昨日目标且仍在当前区间内时,在昨日基础上小幅漂移
-        (向上略强于向下,生活习惯平滑又整体保持高活动量);
-      - 无昨日目标,或昨日目标已不在当前区间(如从旧版 15000 下限升级)
-        时,直接按上偏方式重新抽取,升级当天即进入新区间。
-    返回 (target, plan);plan 为每次应提交的步数增量列表,总和精确等于 target,
-    因此全天提交完后总步数必然落在 [daily_min, daily_max] 区间内。"""
+      - 今日与昨日同阶段且昨日目标仍在该阶段带内:在昨日基础上小幅漂移
+        (带内 ±28% 带宽,生活习惯平滑、同档内不大起大落);
+      - 阶段切换(约 45% 的天数)或昨日目标越界(升级/改配置):直接在新带内重抽,
+        告别"每天都是三万多"的固定感,形成忙闲交替的波次。
+    返回 (target, plan, phase_idx);plan 为每次应提交的步数增量列表,
+    总和精确等于 target,因此全天提交完后总步数必然落在 [daily_min, daily_max] 内。"""
     runs = get_runs_for_date(cfg, date_str, state)
     lo, hi = int(cfg["daily_min"]), int(cfg["daily_max"])
     if prev_target:
@@ -464,15 +510,27 @@ def build_day_plan(cfg, date_str, state, prev_target=None):
             prev_target = int(prev_target)
         except (TypeError, ValueError):
             prev_target = None
-    if prev_target and lo <= prev_target <= hi:
-        drift = random.uniform(-0.20, 0.26) * (hi - lo)   # 上偏漂移:日均约 +750 步
-        target = max(lo, min(hi, int(prev_target + drift)))
-        print(f"信息:目标平滑:昨日目标 {prev_target} 步,今日目标 {target} 步(漂移 {int(target - prev_target):+d})")
+    if prev_phase is not None:
+        try:
+            prev_phase = int(prev_phase)
+        except (TypeError, ValueError):
+            prev_phase = None
+    phases = normalize_phases(lo, hi)
+    idx = pick_phase(phases, prev_phase)
+    ph = phases[idx]
+    if prev_phase == idx and prev_target and ph["lo"] <= prev_target <= ph["hi"]:
+        drift = random.uniform(-0.28, 0.28) * (ph["hi"] - ph["lo"])   # 同阶段带内平滑
+        target = max(ph["lo"], min(ph["hi"], int(prev_target + drift)))
+        print(f"信息:目标平滑({ph['name']}):昨日目标 {prev_target} 步,"
+              f"今日目标 {target} 步(漂移 {int(target - prev_target):+d})")
     else:
-        target = draw_daily_target(lo, hi)
-        if prev_target:
-            print(f"信息:昨日目标 {prev_target} 步已不在当前区间 [{lo},{hi}],重新抽取今日目标 {target} 步")
-    return target, split_daily_target(target, runs)
+        target = draw_phase_target(ph)
+        if prev_target and not (lo <= prev_target <= hi):
+            print(f"信息:昨日目标 {prev_target} 步已不在当前区间 [{lo},{hi}],"
+                  f"直接进入今日阶段「{ph['name']}」重抽目标 {target} 步")
+        else:
+            print(f"信息:今日阶段:「{ph['name']}」(权重 {ph['weight']:g}),抽取目标 {target} 步")
+    return target, split_daily_target(target, runs), idx
 
 
 # 时段节律模板:真人一天的步数增长不是均匀的——早间通勤/晨练是全天主峰之一,
@@ -594,9 +652,13 @@ def process_account(account, password, cfg, state, now):
     now_ts = now.timestamp()
     tag = mask_account(account)   # 提前定义,新一天的日志也要用到
 
-    # 新账号或跨天:重置当日状态,并生成当日步数计划(随机目标 + 拆分)
+    # 新账号或跨天:重置当日状态,并生成当日步数计划(抽阶段 -> 定目标 -> 拆分)
     if entry is None or entry.get("date") != today:
-        target, plan = build_day_plan(cfg, today, state, prev_target=(entry or {}).get("target"))
+        target, plan, phase_idx = build_day_plan(
+            cfg, today, state,
+            prev_target=(entry or {}).get("target"),
+            prev_phase=(entry or {}).get("phase"),
+        )
         entry = {
             "date": today,
             "run_count": 0,       # 今日已提交次数
@@ -604,11 +666,13 @@ def process_account(account, password, cfg, state, now):
             "next_run_ts": 0,     # 下次提交预约时间(Unix 秒级时间戳)
             "fail_count": 0,      # 今日连续失败次数
             "done": False,        # 今日是否已全部完成
-            "target": target,     # 今日目标总步数(22000~34661 之间)
+            "target": target,     # 今日目标总步数(在今日阶段带内,各带合并 22000~34661)
+            "phase": phase_idx,   # 今日阶段(DAILY_PHASES 下标,用于阶段连续波次)
             "plan": plan,         # 每次提交的步数拆分(总和 = target)
         }
         entries[key] = entry
-        print(f"信息:账号:{tag},新的一天:今日目标 {target} 步,分 {len(plan)} 次提交,"
+        ph_name = normalize_phases(int(cfg["daily_min"]), int(cfg["daily_max"]))[phase_idx]["name"]
+        print(f"信息:账号:{tag},新的一天:今日阶段「{ph_name}」,目标 {target} 步,分 {len(plan)} 次提交,"
               f"每份约 {min(plan)}~{max(plan)} 步")
 
     # 今日任务已完成
@@ -646,7 +710,7 @@ def process_account(account, password, cfg, state, now):
     catchup = False     # 补交模式:跳过预约检查,直接连续提交追平进度
 
     # 升级/调参过渡:当日计划的目标已不在当前区间时,重排「剩余次数」:
-    #   - 低于新下限(如旧版 15000) -> 按新区间上偏重抽,把今日总量拉上去;
+    #   - 低于新下限(如旧版 15000) -> 抽阶段并在阶段带内重抽,把今日总量拉上去;
     #   - 高于新上限(如下调区间) -> 已提交部分无法收回,剩余次数只给极小增量,
     #     今日尽量封顶在上限附近,次日起严格落在新区间内
     t_now = int(entry.get("target") or 0)
@@ -655,9 +719,12 @@ def process_account(account, password, cfg, state, now):
         remain = today_runs - entry["run_count"]
         total_now = entry["total_steps"]
         if t_now < lo_now:
-            new_target = max(draw_daily_target(lo_now, hi_now), total_now + remain)
+            _phases = normalize_phases(lo_now, hi_now)
+            _pidx = pick_phase(_phases)
+            new_target = max(draw_phase_target(_phases[_pidx]), total_now + remain)
             rem_plan = split_daily_target(new_target - total_now, remain)
-            action = f"提升到 {new_target}"
+            entry["phase"] = _pidx
+            action = f"提升到 {new_target}({_phases[_pidx]['name']})"
         else:
             rem_amt = max(hi_now - total_now, remain)
             if hi_now > total_now:
@@ -706,11 +773,14 @@ def process_account(account, password, cfg, state, now):
         # 到点(或错过预约后的补交):取当日计划的下一份(保证全天总和 = 目标)
         plan = entry.get("plan") or []
         if len(plan) < today_runs:
-            # 旧状态文件无当日计划(升级过渡期):现定目标并拆分,剩余次数继续沿用
-            tgt = draw_daily_target(int(cfg["daily_min"]), int(cfg["daily_max"]))
+            # 旧状态文件无当日计划(升级过渡期):现抽阶段定目标并拆分,剩余次数继续沿用
+            _phases = normalize_phases(int(cfg["daily_min"]), int(cfg["daily_max"]))
+            _pidx = pick_phase(_phases)
+            tgt = draw_phase_target(_phases[_pidx])
             plan = split_daily_target(tgt, today_runs)
             entry["plan"] = plan
-            print(f"信息:账号:{tag},当日无完整步数计划(升级过渡),现生成:目标 {tgt} 步/{today_runs} 次")
+            entry["phase"] = _pidx
+            print(f"信息:账号:{tag},当日无完整步数计划(升级过渡),现生成:阶段「{_phases[_pidx]['name']}」目标 {tgt} 步/{today_runs} 次")
         delta = int(plan[entry["run_count"]])
         new_total = entry["total_steps"] + delta
         which = entry["run_count"] + 1
@@ -940,11 +1010,12 @@ def build_account_group():
         # 每行格式: [账号, 密码, 步数配置]
         # 第三个元素(步数配置)的取值:
         #   None            -> 全局默认(分时段累加):每天 6 点开始,每 1~2 小时随机提交一次;
-        #                      每日总步数随机 22000~34661(偏向上半段),工作日(周一至周五)14 次,休息日 10 次
+        #                      每日目标先抽阶段(轻松/常规/活跃,权重见 DAILY_PHASES)
+        #                      再在阶段带内随机,合计 22000~34661;工作日(周一至周五)14 次,休息日 10 次
         #   dict            -> 自定义参数,可选字段:
         #                      start_hour(开始小时) / weekday_runs(工作日次数) /
         #                      weekend_runs(休息日次数) / runs_per_day(每天固定次数,优先级最高) /
-        #                      daily_min, daily_max(每日总步数目标范围) /
+        #                      daily_min, daily_max(每日总步数目标范围,阶段带自动裁剪到该范围) /
         #                      step_min, step_max(兑底用单次累加范围) /
         #                      interval_min, interval_max(间隔分钟范围)
         #                      如 {"weekday_runs": 12, "weekend_runs": 8, "daily_min": 20000, "daily_max": 35000}
